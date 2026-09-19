@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# uv / tooling caches
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# Environment / secrets
+.env
+.env.*
+
+# Tool output (default output dir is ~/Documents/video-summaries;
+# this ignores any copy written inside the repo via --out)
+video-summaries/
+out/
+
+# macOS
+.DS_Store
+
+# Editors
+.idea/
+.vscode/
+*.swp

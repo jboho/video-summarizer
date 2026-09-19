@@ -1,0 +1,9 @@
+# Tooling config only. The tool itself is a single-file uv script
+# (summarize_video.py) with PEP 723 inline dependencies; it is not packaged.
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
