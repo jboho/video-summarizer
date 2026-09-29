@@ -500,6 +500,13 @@ def main() -> None:
     )
     args = ap.parse_args()
 
+    provider = resolve_provider(args.model, args.provider, args.base_url)
+    price_override = (
+        (args.price_in, args.price_out)
+        if args.price_in is not None and args.price_out is not None
+        else None
+    )
+
     check_yt_dlp()
 
     print("Fetching video details...")
@@ -554,6 +561,7 @@ def main() -> None:
         "transcript_segments": len(segments),
         "chapters": len(chapters),
         "summary_model": None if args.no_summary else args.model,
+        "summary_provider": None if args.no_summary else provider,
     }
     (folder / "metadata.json").write_text(
         json.dumps(run_info, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -565,15 +573,28 @@ def main() -> None:
     )
 
     if not args.no_summary:
-        if not os.environ.get("ANTHROPIC_API_KEY"):
+        if provider == "anthropic":
+            key_name = "ANTHROPIC_API_KEY"
+        else:
+            key_name = "OPENAI_API_KEY"
+            # Local runtimes (Ollama/LM Studio/vLLM) ignore the key but the SDK
+            # still requires one; supply a harmless placeholder when a base URL
+            # is set and no key is present.
+            base = args.base_url or os.environ.get("OPENAI_BASE_URL")
+            if base and not os.environ.get("OPENAI_API_KEY"):
+                os.environ["OPENAI_API_KEY"] = "not-needed"
+
+        if not os.environ.get(key_name):
             print(
-                "warning: ANTHROPIC_API_KEY not set; skipping summary. "
+                f"warning: {key_name} not set; skipping summary. "
                 "Transcript files were still saved.",
                 file=sys.stderr,
             )
         else:
-            print(f"Summarizing with {args.model}...")
-            summary, usage = summarize(args.model, meta, transcript)
+            print(f"Summarizing with {args.model} ({provider})...")
+            summary, usage = summarize(
+                provider, args.model, meta, transcript, args.base_url
+            )
             (folder / "summary.md").write_text(
                 f"# {title}\n\n"
                 f"[Watch]({meta.get('webpage_url')}) · "
@@ -581,7 +602,9 @@ def main() -> None:
                 f"{summary}\n",
                 encoding="utf-8",
             )
-            cost = estimate_cost(args.model, usage)
+            cost = estimate_cost(
+                args.model, normalize_usage(provider, usage), price_override
+            )
             print("Summary saved" + (f" (~{cost})" if cost else ""))
 
     print(f"\nDone: {folder}")
