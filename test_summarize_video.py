@@ -1,4 +1,5 @@
 import importlib
+from types import SimpleNamespace
 
 sv = importlib.import_module("summarize_video")
 
@@ -29,3 +30,17 @@ def test_resolve_provider_base_url_forces_openai(monkeypatch):
 def test_resolve_provider_env_base_url_forces_openai(monkeypatch):
     monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
     assert sv.resolve_provider("some-model", "auto", None) == "openai"
+
+
+def test_normalize_usage_anthropic():
+    u = SimpleNamespace(input_tokens=10, output_tokens=20)
+    assert sv.normalize_usage("anthropic", u) == (10, 20)
+
+
+def test_normalize_usage_openai():
+    u = SimpleNamespace(prompt_tokens=5, completion_tokens=7)
+    assert sv.normalize_usage("openai", u) == (5, 7)
+
+
+def test_normalize_usage_none():
+    assert sv.normalize_usage("openai", None) is None

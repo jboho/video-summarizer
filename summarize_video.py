@@ -371,6 +371,15 @@ def summarize(model: str, meta: dict, transcript: str) -> tuple[str, object]:
     return text, response.usage
 
 
+def normalize_usage(provider: str, usage) -> tuple[int, int] | None:
+    """Collapse the two SDKs' usage objects into one (input, output) tuple."""
+    if usage is None:
+        return None
+    if provider == "anthropic":
+        return (usage.input_tokens, usage.output_tokens)
+    return (usage.prompt_tokens, usage.completion_tokens)
+
+
 def estimate_cost(model: str, usage) -> str | None:
     # First-party input/output $ per 1M tokens for common models.
     prices = {
