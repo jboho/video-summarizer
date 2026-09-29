@@ -386,7 +386,8 @@ def summarize_openai(
 
     stream = client.chat.completions.create(
         model=model,
-        max_tokens=16000,  # see plan: newer OpenAI reasoning models want max_completion_tokens
+        # see plan: newer OpenAI reasoning models want max_completion_tokens
+        max_tokens=16000,
         stream=True,
         stream_options={"include_usage": True},
         messages=[

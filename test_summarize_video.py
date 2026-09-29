@@ -97,7 +97,9 @@ class _FakeAnthropicClient:
 
 
 def _install_fake_anthropic(monkeypatch, response, recorder):
-    fake_mod = SimpleNamespace(Anthropic=lambda: _FakeAnthropicClient(response, recorder))
+    fake_mod = SimpleNamespace(
+        Anthropic=lambda: _FakeAnthropicClient(response, recorder)
+    )
     monkeypatch.setitem(sys.modules, "anthropic", fake_mod)
 
 
@@ -174,10 +176,17 @@ def _install_fake_openai(monkeypatch, events, recorder):
 
 
 def test_summarize_openai_assembles_and_captures_usage(monkeypatch):
-    events = [_sse("Hello "), _sse("world"), _sse(finish_reason="stop"), _usage_event(11, 22)]
+    events = [
+        _sse("Hello "),
+        _sse("world"),
+        _sse(finish_reason="stop"),
+        _usage_event(11, 22),
+    ]
     recorder = {}
     _install_fake_openai(monkeypatch, events, recorder)
-    text, usage = sv.summarize_openai("gpt-4o-mini", {"title": "T", "duration": 0}, "body", None)
+    text, usage = sv.summarize_openai(
+        "gpt-4o-mini", {"title": "T", "duration": 0}, "body", None
+    )
     assert text == "Hello world"
     assert usage.prompt_tokens == 11 and usage.completion_tokens == 22
     msgs = recorder["messages"]
@@ -201,7 +210,10 @@ def test_summarize_openai_content_filter_exits(monkeypatch):
 
 
 def test_summarize_openai_refusal_exits(monkeypatch):
-    events = [_sse("partial"), _sse(refusal="I can't help with that", finish_reason="stop")]
+    events = [
+        _sse("partial"),
+        _sse(refusal="I can't help with that", finish_reason="stop"),
+    ]
     _install_fake_openai(monkeypatch, events, {})
     with pytest.raises(SystemExit):
         sv.summarize_openai("gpt-4o-mini", {"title": "T", "duration": 0}, "body", None)
@@ -209,15 +221,31 @@ def test_summarize_openai_refusal_exits(monkeypatch):
 
 def test_summarize_dispatches_to_anthropic(monkeypatch):
     called = {}
-    monkeypatch.setattr(sv, "summarize_anthropic", lambda m, meta, t: (called.setdefault("p", "a"), None))
-    monkeypatch.setattr(sv, "summarize_openai", lambda m, meta, t, b: (called.setdefault("p", "o"), None))
+    monkeypatch.setattr(
+        sv,
+        "summarize_anthropic",
+        lambda m, meta, t: (called.setdefault("p", "a"), None),
+    )
+    monkeypatch.setattr(
+        sv,
+        "summarize_openai",
+        lambda m, meta, t, b: (called.setdefault("p", "o"), None),
+    )
     text, _ = sv.summarize("anthropic", "claude-sonnet-5", {}, "body", None)
     assert called["p"] == "a" and text == "a"
 
 
 def test_summarize_dispatches_to_openai(monkeypatch):
     called = {}
-    monkeypatch.setattr(sv, "summarize_anthropic", lambda m, meta, t: (called.setdefault("p", "a"), None))
-    monkeypatch.setattr(sv, "summarize_openai", lambda m, meta, t, b: (called.setdefault("p", "o"), None))
+    monkeypatch.setattr(
+        sv,
+        "summarize_anthropic",
+        lambda m, meta, t: (called.setdefault("p", "a"), None),
+    )
+    monkeypatch.setattr(
+        sv,
+        "summarize_openai",
+        lambda m, meta, t, b: (called.setdefault("p", "o"), None),
+    )
     text, _ = sv.summarize("openai", "gpt-4o-mini", {}, "body", "http://h/v1")
     assert called["p"] == "o" and text == "o"
