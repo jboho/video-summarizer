@@ -420,6 +420,14 @@ def summarize_openai(
     return text, usage
 
 
+def summarize(
+    provider: str, model: str, meta: dict, transcript: str, base_url: str | None
+) -> tuple[str, object]:
+    if provider == "anthropic":
+        return summarize_anthropic(model, meta, transcript)
+    return summarize_openai(model, meta, transcript, base_url)
+
+
 def normalize_usage(provider: str, usage) -> tuple[int, int] | None:
     """Collapse the two SDKs' usage objects into one (input, output) tuple."""
     if usage is None:

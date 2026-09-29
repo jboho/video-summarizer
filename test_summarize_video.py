@@ -205,3 +205,19 @@ def test_summarize_openai_refusal_exits(monkeypatch):
     _install_fake_openai(monkeypatch, events, {})
     with pytest.raises(SystemExit):
         sv.summarize_openai("gpt-4o-mini", {"title": "T", "duration": 0}, "body", None)
+
+
+def test_summarize_dispatches_to_anthropic(monkeypatch):
+    called = {}
+    monkeypatch.setattr(sv, "summarize_anthropic", lambda m, meta, t: (called.setdefault("p", "a"), None))
+    monkeypatch.setattr(sv, "summarize_openai", lambda m, meta, t, b: (called.setdefault("p", "o"), None))
+    text, _ = sv.summarize("anthropic", "claude-sonnet-5", {}, "body", None)
+    assert called["p"] == "a" and text == "a"
+
+
+def test_summarize_dispatches_to_openai(monkeypatch):
+    called = {}
+    monkeypatch.setattr(sv, "summarize_anthropic", lambda m, meta, t: (called.setdefault("p", "a"), None))
+    monkeypatch.setattr(sv, "summarize_openai", lambda m, meta, t, b: (called.setdefault("p", "o"), None))
+    text, _ = sv.summarize("openai", "gpt-4o-mini", {}, "body", "http://h/v1")
+    assert called["p"] == "o" and text == "o"
