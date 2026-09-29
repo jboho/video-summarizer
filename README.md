@@ -23,7 +23,7 @@ audio, so a video with no captions won't work (see "Videos without captions").
 
 - `yt-dlp` on your PATH — `brew install yt-dlp`
 - `uv` — already installed; it handles the Python dependency automatically
-- `ANTHROPIC_API_KEY` set in your environment (only needed for the summary)
+- An API key for the summary step: `ANTHROPIC_API_KEY` for Claude (the default), or `OPENAI_API_KEY` for OpenAI-compatible endpoints. Not needed with `--no-summary`, and local endpoints (Ollama/LM Studio) need no key.
 
 ## Usage
 
@@ -35,7 +35,10 @@ Options:
 
 | Flag | Meaning |
 |------|---------|
-| `--model MODEL` | Which Claude model to use. Default `claude-sonnet-5` (cheaper, plenty for summaries). Use `claude-opus-5` for sharper reasoning. |
+| `--model MODEL` | Model to use. Default `claude-sonnet-5`. Use `claude-opus-5` for sharper reasoning, or any OpenAI-compatible model name (e.g. `gpt-4o-mini`). |
+| `--provider auto\|anthropic\|openai` | Which provider path to use. `auto` (default) infers from the model name and `--base-url`. |
+| `--base-url URL` | An OpenAI-compatible endpoint (e.g. `https://openrouter.ai/api/v1`, or `http://localhost:11434/v1` for Ollama). Forces the OpenAI path. |
+| `--price-in N` / `--price-out N` | Cost-estimate override in dollars per 1M input / output tokens, for models not in the built-in price table. |
 | `--out DIR` | Output directory. Default `~/Documents/video-summaries`. |
 | `--no-summary` | Fetch and format the transcript only; skip the Claude call (no cost). |
 
@@ -51,6 +54,36 @@ alias vidsum="/Users/jboho/Code/video-summarizer/summarize_video.py"
 ```
 
 Then: `vidsum "https://youtu.be/..."`
+
+## Using other models
+
+This tool was built for Claude, and Claude stays the default. It also works with
+any endpoint that speaks the OpenAI Chat Completions API — hosted or local.
+
+The provider is chosen automatically: a `claude-*` model uses the Anthropic SDK; any
+other model, or setting `--base-url`, uses the OpenAI-compatible path. Force it with
+`--provider anthropic|openai`.
+
+```bash
+# Claude (default) — needs ANTHROPIC_API_KEY
+vidsum "https://youtu.be/..."
+
+# OpenAI — needs OPENAI_API_KEY
+vidsum "https://youtu.be/..." --model gpt-4o-mini
+
+# OpenRouter — needs OPENAI_API_KEY set to your OpenRouter key
+vidsum "https://youtu.be/..." --model anthropic/claude-sonnet-5 \
+  --base-url https://openrouter.ai/api/v1
+
+# Local Ollama — no key needed
+vidsum "https://youtu.be/..." --model llama3.1 \
+  --base-url http://localhost:11434/v1
+```
+
+Cost is estimated only for models in the built-in price table; for anything else,
+pass `--price-in` and `--price-out` (dollars per 1M tokens) to get an estimate.
+
+Note: adaptive thinking is a Claude-only feature and is skipped on the OpenAI path.
 
 ## Output
 
