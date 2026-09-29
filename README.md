@@ -47,7 +47,7 @@ Add an alias so you can run it from anywhere:
 
 ```bash
 # in ~/.zshrc
-alias vidsum="/Users/jboho/Code/video-summarizer/summarize_video.py"
+alias vidsum="/path/to/video-summarizer/summarize_video.py"
 ```
 
 Then: `vidsum "https://youtu.be/..."`
