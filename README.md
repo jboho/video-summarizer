@@ -81,7 +81,8 @@ vidsum "https://youtu.be/..." --model llama3.1 \
 ```
 
 Cost is estimated only for models in the built-in price table; for anything else,
-pass `--price-in` and `--price-out` (dollars per 1M tokens) to get an estimate.
+pass both `--price-in` and `--price-out` (dollars per 1M tokens) to get an estimate.
+Passing only one is ignored.
 
 Note: adaptive thinking is a Claude-only feature and is skipped on the OpenAI path.
 
@@ -98,7 +99,8 @@ Each run creates one folder, e.g.
 - `transcript.txt` — plain transcript with a timestamp marker every 30 seconds
   (this is the exact text sent to Claude).
 - `transcript.raw.vtt` — the original subtitle file, kept as-is.
-- `metadata.json` — video details, chapter count, and which model summarized it.
+- `metadata.json` — video details, chapter count, and which provider and model
+  summarized it.
 
 ## Cost
 
