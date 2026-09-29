@@ -44,3 +44,21 @@ def test_normalize_usage_openai():
 
 def test_normalize_usage_none():
     assert sv.normalize_usage("openai", None) is None
+
+
+def test_estimate_cost_known_model():
+    got = sv.estimate_cost("claude-sonnet-5", (1_000_000, 1_000_000), None)
+    assert got == "$12.000 (1000000 in / 1000000 out)"
+
+
+def test_estimate_cost_unknown_model_returns_none():
+    assert sv.estimate_cost("mystery-model", (100, 100), None) is None
+
+
+def test_estimate_cost_override():
+    got = sv.estimate_cost("mystery-model", (1_000_000, 1_000_000), (1.0, 2.0))
+    assert got == "$3.000 (1000000 in / 1000000 out)"
+
+
+def test_estimate_cost_none_usage():
+    assert sv.estimate_cost("claude-sonnet-5", None, None) is None

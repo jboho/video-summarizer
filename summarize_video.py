@@ -380,18 +380,31 @@ def normalize_usage(provider: str, usage) -> tuple[int, int] | None:
     return (usage.prompt_tokens, usage.completion_tokens)
 
 
-def estimate_cost(model: str, usage) -> str | None:
-    # First-party input/output $ per 1M tokens for common models.
-    prices = {
-        "claude-opus-5": (5.0, 25.0),
-        "claude-sonnet-5": (2.0, 10.0),
-        "claude-haiku-4-5": (1.0, 5.0),
-    }
-    if model not in prices or usage is None:
+# input/output $ per 1M tokens for common models. Unknown models -> no estimate.
+PRICES = {
+    "claude-opus-5": (5.0, 25.0),
+    "claude-sonnet-5": (2.0, 10.0),
+    "claude-haiku-4-5": (1.0, 5.0),
+    "gpt-4o": (2.5, 10.0),
+    "gpt-4o-mini": (0.15, 0.6),
+    "gpt-4.1-mini": (0.4, 1.6),
+}
+
+
+def estimate_cost(
+    model: str,
+    usage: tuple[int, int] | None,
+    price_override: tuple[float, float] | None,
+) -> str | None:
+    if usage is None:
         return None
-    pin, pout = prices[model]
-    cost = (usage.input_tokens * pin + usage.output_tokens * pout) / 1_000_000
-    return f"${cost:.3f} ({usage.input_tokens} in / {usage.output_tokens} out)"
+    price = price_override or PRICES.get(model)
+    if price is None:
+        return None
+    tin, tout = usage
+    pin, pout = price
+    cost = (tin * pin + tout * pout) / 1_000_000
+    return f"${cost:.3f} ({tin} in / {tout} out)"
 
 
 def main() -> None:
