@@ -45,6 +45,16 @@ DEFAULT_OUT = os.environ.get(
 TIMESTAMP_EVERY_SECONDS = 30
 
 
+def resolve_provider(model: str, provider_arg: str, base_url: str | None) -> str:
+    """Pick the summarizer provider. Explicit flag wins; a base URL forces the
+    OpenAI-compatible path; otherwise infer from the model name."""
+    if provider_arg and provider_arg != "auto":
+        return provider_arg
+    if base_url or os.environ.get("OPENAI_BASE_URL"):
+        return "openai"
+    return "anthropic" if model.startswith("claude") else "openai"
+
+
 def die(msg: str, code: int = 1) -> None:
     print(f"error: {msg}", file=sys.stderr)
     sys.exit(code)
