@@ -134,7 +134,6 @@ def test_summarize_anthropic_refusal_exits(monkeypatch):
         usage=None,
     )
     _install_fake_anthropic(monkeypatch, response, {})
-    import pytest
     with pytest.raises(SystemExit):
         sv.summarize_anthropic("claude-sonnet-5", {"title": "T", "duration": 0}, "body")
 
@@ -196,6 +195,13 @@ def test_summarize_openai_passes_base_url(monkeypatch):
 
 def test_summarize_openai_content_filter_exits(monkeypatch):
     events = [_sse("partial"), _sse(finish_reason="content_filter")]
+    _install_fake_openai(monkeypatch, events, {})
+    with pytest.raises(SystemExit):
+        sv.summarize_openai("gpt-4o-mini", {"title": "T", "duration": 0}, "body", None)
+
+
+def test_summarize_openai_refusal_exits(monkeypatch):
+    events = [_sse("partial"), _sse(refusal="I can't help with that", finish_reason="stop")]
     _install_fake_openai(monkeypatch, events, {})
     with pytest.raises(SystemExit):
         sv.summarize_openai("gpt-4o-mini", {"title": "T", "duration": 0}, "body", None)
