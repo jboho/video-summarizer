@@ -335,21 +335,25 @@ marker. Skip this section if nothing stands out.
 """
 
 
-def summarize(model: str, meta: dict, transcript: str) -> tuple[str, object]:
-    import anthropic
-
-    client = anthropic.Anthropic()
+def build_user_content(meta: dict, transcript: str) -> str:
     header = (
         f"Title: {meta.get('title')}\n"
         f"Channel: {meta.get('uploader') or meta.get('channel')}\n"
         f"Duration: {_fmt_clock(meta.get('duration') or 0)}\n"
         f"URL: {meta.get('webpage_url')}\n"
     )
-    user_content = (
+    return (
         f"{SUMMARY_INSTRUCTIONS}\n"
         f"---\nVideo details:\n{header}\n"
         f"---\nTranscript:\n\n{transcript}"
     )
+
+
+def summarize_anthropic(model: str, meta: dict, transcript: str) -> tuple[str, object]:
+    import anthropic
+
+    client = anthropic.Anthropic()
+    user_content = build_user_content(meta, transcript)
 
     # Stream because a long transcript is a long request; get_final_message()
     # returns the assembled response. Adaptive thinking improves structure.
