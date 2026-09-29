@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["anthropic>=1.0"]
+# dependencies = ["anthropic>=1.0", "openai>=1.0"]
 # ///
 """
 Fetch a video's transcript, format it, summarize it with Claude, and save
@@ -380,6 +380,30 @@ def main() -> None:
     ap.add_argument("url", help="Video URL (YouTube or any yt-dlp-supported site)")
     ap.add_argument("--model", default=DEFAULT_MODEL, help=f"default: {DEFAULT_MODEL}")
     ap.add_argument("--out", default=DEFAULT_OUT, help=f"default: {DEFAULT_OUT}")
+    ap.add_argument(
+        "--provider",
+        choices=["auto", "anthropic", "openai"],
+        default="auto",
+        help="Model provider. 'auto' infers from --model/--base-url (default: auto).",
+    )
+    ap.add_argument(
+        "--base-url",
+        default=None,
+        help="OpenAI-compatible endpoint (e.g. http://localhost:11434/v1 for Ollama, "
+        "https://openrouter.ai/api/v1 for OpenRouter). Forces the openai provider.",
+    )
+    ap.add_argument(
+        "--price-in",
+        type=float,
+        default=None,
+        help="$ per 1M input tokens (cost override)",
+    )
+    ap.add_argument(
+        "--price-out",
+        type=float,
+        default=None,
+        help="$ per 1M output tokens (cost override)",
+    )
     ap.add_argument(
         "--no-summary",
         action="store_true",
