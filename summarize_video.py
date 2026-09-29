@@ -375,6 +375,51 @@ def summarize_anthropic(model: str, meta: dict, transcript: str) -> tuple[str, o
     return text, response.usage
 
 
+def summarize_openai(
+    model: str, meta: dict, transcript: str, base_url: str | None
+) -> tuple[str, object]:
+    from openai import OpenAI
+
+    resolved_base = base_url or os.environ.get("OPENAI_BASE_URL") or None
+    client = OpenAI(base_url=resolved_base)
+    user_content = build_user_content(meta, transcript)
+
+    stream = client.chat.completions.create(
+        model=model,
+        max_tokens=16000,  # see plan: newer OpenAI reasoning models want max_completion_tokens
+        stream=True,
+        stream_options={"include_usage": True},
+        messages=[
+            {"role": "system", "content": SUMMARY_SYSTEM},
+            {"role": "user", "content": user_content},
+        ],
+    )
+
+    parts: list[str] = []
+    usage = None
+    finish = None
+    refused = False
+    for event in stream:
+        if event.choices:
+            choice = event.choices[0]
+            delta = getattr(choice, "delta", None)
+            if delta is not None:
+                if getattr(delta, "content", None):
+                    parts.append(delta.content)
+                if getattr(delta, "refusal", None):
+                    refused = True
+            if choice.finish_reason:
+                finish = choice.finish_reason
+        if getattr(event, "usage", None):
+            usage = event.usage
+
+    if refused or finish == "content_filter":
+        die(f"The model declined to summarize this video (finish_reason: {finish}).")
+
+    text = "".join(parts).strip()
+    return text, usage
+
+
 def normalize_usage(provider: str, usage) -> tuple[int, int] | None:
     """Collapse the two SDKs' usage objects into one (input, output) tuple."""
     if usage is None:

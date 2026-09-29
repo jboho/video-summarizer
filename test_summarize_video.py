@@ -2,6 +2,8 @@ import importlib
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 sv = importlib.import_module("summarize_video")
 
 
@@ -135,3 +137,65 @@ def test_summarize_anthropic_refusal_exits(monkeypatch):
     import pytest
     with pytest.raises(SystemExit):
         sv.summarize_anthropic("claude-sonnet-5", {"title": "T", "duration": 0}, "body")
+
+
+def _sse(content=None, finish_reason=None, refusal=None):
+    delta = SimpleNamespace(content=content, refusal=refusal)
+    choice = SimpleNamespace(delta=delta, finish_reason=finish_reason)
+    return SimpleNamespace(choices=[choice], usage=None)
+
+
+def _usage_event(pin, pout):
+    return SimpleNamespace(
+        choices=[], usage=SimpleNamespace(prompt_tokens=pin, completion_tokens=pout)
+    )
+
+
+class _FakeCompletions:
+    def __init__(self, events, recorder):
+        self._events = events
+        self._recorder = recorder
+
+    def create(self, **kwargs):
+        self._recorder.update(kwargs)
+        return iter(self._events)
+
+
+class _FakeOpenAIClient:
+    def __init__(self, events, recorder, base_url=None):
+        recorder["base_url"] = base_url
+        self.chat = SimpleNamespace(completions=_FakeCompletions(events, recorder))
+
+
+def _install_fake_openai(monkeypatch, events, recorder):
+    fake_mod = SimpleNamespace(
+        OpenAI=lambda base_url=None: _FakeOpenAIClient(events, recorder, base_url)
+    )
+    monkeypatch.setitem(sys.modules, "openai", fake_mod)
+
+
+def test_summarize_openai_assembles_and_captures_usage(monkeypatch):
+    events = [_sse("Hello "), _sse("world"), _sse(finish_reason="stop"), _usage_event(11, 22)]
+    recorder = {}
+    _install_fake_openai(monkeypatch, events, recorder)
+    text, usage = sv.summarize_openai("gpt-4o-mini", {"title": "T", "duration": 0}, "body", None)
+    assert text == "Hello world"
+    assert usage.prompt_tokens == 11 and usage.completion_tokens == 22
+    msgs = recorder["messages"]
+    assert msgs[0] == {"role": "system", "content": sv.SUMMARY_SYSTEM}
+    assert msgs[1]["role"] == "user"
+
+
+def test_summarize_openai_passes_base_url(monkeypatch):
+    events = [_sse("x"), _sse(finish_reason="stop")]
+    recorder = {}
+    _install_fake_openai(monkeypatch, events, recorder)
+    sv.summarize_openai("llama3", {"title": "T", "duration": 0}, "body", "http://localhost:11434/v1")
+    assert recorder["base_url"] == "http://localhost:11434/v1"
+
+
+def test_summarize_openai_content_filter_exits(monkeypatch):
+    events = [_sse("partial"), _sse(finish_reason="content_filter")]
+    _install_fake_openai(monkeypatch, events, {})
+    with pytest.raises(SystemExit):
+        sv.summarize_openai("gpt-4o-mini", {"title": "T", "duration": 0}, "body", None)
