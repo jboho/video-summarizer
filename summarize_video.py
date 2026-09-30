@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["anthropic>=1.0"]
+# dependencies = ["anthropic>=1.0", "openai>=1.0"]
 # ///
 """
 Fetch a video's transcript, format it, summarize it with Claude, and save
@@ -43,6 +43,16 @@ DEFAULT_OUT = os.environ.get(
 
 # Emit a timestamp marker in the formatted transcript at least this often.
 TIMESTAMP_EVERY_SECONDS = 30
+
+
+def resolve_provider(model: str, provider_arg: str, base_url: str | None) -> str:
+    """Pick the summarizer provider. Explicit flag wins; a base URL forces the
+    OpenAI-compatible path; otherwise infer from the model name."""
+    if provider_arg and provider_arg != "auto":
+        return provider_arg
+    if base_url or os.environ.get("OPENAI_BASE_URL"):
+        return "openai"
+    return "anthropic" if model.startswith("claude") else "openai"
 
 
 def die(msg: str, code: int = 1) -> None:
@@ -325,21 +335,25 @@ marker. Skip this section if nothing stands out.
 """
 
 
-def summarize(model: str, meta: dict, transcript: str) -> tuple[str, object]:
-    import anthropic
-
-    client = anthropic.Anthropic()
+def build_user_content(meta: dict, transcript: str) -> str:
     header = (
         f"Title: {meta.get('title')}\n"
         f"Channel: {meta.get('uploader') or meta.get('channel')}\n"
         f"Duration: {_fmt_clock(meta.get('duration') or 0)}\n"
         f"URL: {meta.get('webpage_url')}\n"
     )
-    user_content = (
+    return (
         f"{SUMMARY_INSTRUCTIONS}\n"
         f"---\nVideo details:\n{header}\n"
         f"---\nTranscript:\n\n{transcript}"
     )
+
+
+def summarize_anthropic(model: str, meta: dict, transcript: str) -> tuple[str, object]:
+    import anthropic
+
+    client = anthropic.Anthropic()
+    user_content = build_user_content(meta, transcript)
 
     # Stream because a long transcript is a long request; get_final_message()
     # returns the assembled response. Adaptive thinking improves structure.
@@ -361,18 +375,94 @@ def summarize(model: str, meta: dict, transcript: str) -> tuple[str, object]:
     return text, response.usage
 
 
-def estimate_cost(model: str, usage) -> str | None:
-    # First-party input/output $ per 1M tokens for common models.
-    prices = {
-        "claude-opus-5": (5.0, 25.0),
-        "claude-sonnet-5": (2.0, 10.0),
-        "claude-haiku-4-5": (1.0, 5.0),
-    }
-    if model not in prices or usage is None:
+def summarize_openai(
+    model: str, meta: dict, transcript: str, base_url: str | None
+) -> tuple[str, object]:
+    from openai import OpenAI
+
+    resolved_base = base_url or os.environ.get("OPENAI_BASE_URL") or None
+    client = OpenAI(base_url=resolved_base)
+    user_content = build_user_content(meta, transcript)
+
+    stream = client.chat.completions.create(
+        model=model,
+        # see plan: newer OpenAI reasoning models want max_completion_tokens
+        max_tokens=16000,
+        stream=True,
+        stream_options={"include_usage": True},
+        messages=[
+            {"role": "system", "content": SUMMARY_SYSTEM},
+            {"role": "user", "content": user_content},
+        ],
+    )
+
+    parts: list[str] = []
+    usage = None
+    finish = None
+    refused = False
+    for event in stream:
+        if event.choices:
+            choice = event.choices[0]
+            delta = getattr(choice, "delta", None)
+            if delta is not None:
+                if getattr(delta, "content", None):
+                    parts.append(delta.content)
+                if getattr(delta, "refusal", None):
+                    refused = True
+            if choice.finish_reason:
+                finish = choice.finish_reason
+        if getattr(event, "usage", None):
+            usage = event.usage
+
+    if refused or finish == "content_filter":
+        die(f"The model declined to summarize this video (finish_reason: {finish}).")
+
+    text = "".join(parts).strip()
+    return text, usage
+
+
+def summarize(
+    provider: str, model: str, meta: dict, transcript: str, base_url: str | None
+) -> tuple[str, object]:
+    if provider == "anthropic":
+        return summarize_anthropic(model, meta, transcript)
+    return summarize_openai(model, meta, transcript, base_url)
+
+
+def normalize_usage(provider: str, usage) -> tuple[int, int] | None:
+    """Collapse the two SDKs' usage objects into one (input, output) tuple."""
+    if usage is None:
         return None
-    pin, pout = prices[model]
-    cost = (usage.input_tokens * pin + usage.output_tokens * pout) / 1_000_000
-    return f"${cost:.3f} ({usage.input_tokens} in / {usage.output_tokens} out)"
+    if provider == "anthropic":
+        return (usage.input_tokens, usage.output_tokens)
+    return (usage.prompt_tokens, usage.completion_tokens)
+
+
+# input/output $ per 1M tokens for common models. Unknown models -> no estimate.
+PRICES = {
+    "claude-opus-5": (5.0, 25.0),
+    "claude-sonnet-5": (2.0, 10.0),
+    "claude-haiku-4-5": (1.0, 5.0),
+    "gpt-4o": (2.5, 10.0),
+    "gpt-4o-mini": (0.15, 0.6),
+    "gpt-4.1-mini": (0.4, 1.6),
+}
+
+
+def estimate_cost(
+    model: str,
+    usage: tuple[int, int] | None,
+    price_override: tuple[float, float] | None,
+) -> str | None:
+    if usage is None:
+        return None
+    price = price_override or PRICES.get(model)
+    if price is None:
+        return None
+    tin, tout = usage
+    pin, pout = price
+    cost = (tin * pin + tout * pout) / 1_000_000
+    return f"${cost:.3f} ({tin} in / {tout} out)"
 
 
 def main() -> None:
@@ -381,11 +471,42 @@ def main() -> None:
     ap.add_argument("--model", default=DEFAULT_MODEL, help=f"default: {DEFAULT_MODEL}")
     ap.add_argument("--out", default=DEFAULT_OUT, help=f"default: {DEFAULT_OUT}")
     ap.add_argument(
+        "--provider",
+        choices=["auto", "anthropic", "openai"],
+        default="auto",
+        help="Model provider. 'auto' infers from --model/--base-url (default: auto).",
+    )
+    ap.add_argument(
+        "--base-url",
+        default=None,
+        help="OpenAI-compatible endpoint (e.g. http://localhost:11434/v1 for Ollama, "
+        "https://openrouter.ai/api/v1 for OpenRouter). Forces the openai provider.",
+    )
+    ap.add_argument(
+        "--price-in",
+        type=float,
+        default=None,
+        help="$ per 1M input tokens (cost override)",
+    )
+    ap.add_argument(
+        "--price-out",
+        type=float,
+        default=None,
+        help="$ per 1M output tokens (cost override)",
+    )
+    ap.add_argument(
         "--no-summary",
         action="store_true",
         help="Fetch and format the transcript only; skip the Claude summary.",
     )
     args = ap.parse_args()
+
+    provider = resolve_provider(args.model, args.provider, args.base_url)
+    price_override = (
+        (args.price_in, args.price_out)
+        if args.price_in is not None and args.price_out is not None
+        else None
+    )
 
     check_yt_dlp()
 
@@ -441,6 +562,7 @@ def main() -> None:
         "transcript_segments": len(segments),
         "chapters": len(chapters),
         "summary_model": None if args.no_summary else args.model,
+        "summary_provider": None if args.no_summary else provider,
     }
     (folder / "metadata.json").write_text(
         json.dumps(run_info, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -452,15 +574,28 @@ def main() -> None:
     )
 
     if not args.no_summary:
-        if not os.environ.get("ANTHROPIC_API_KEY"):
+        if provider == "anthropic":
+            key_name = "ANTHROPIC_API_KEY"
+        else:
+            key_name = "OPENAI_API_KEY"
+            # Local runtimes (Ollama/LM Studio/vLLM) ignore the key but the SDK
+            # still requires one; supply a harmless placeholder when a base URL
+            # is set and no key is present.
+            base = args.base_url or os.environ.get("OPENAI_BASE_URL")
+            if base and not os.environ.get("OPENAI_API_KEY"):
+                os.environ["OPENAI_API_KEY"] = "not-needed"
+
+        if not os.environ.get(key_name):
             print(
-                "warning: ANTHROPIC_API_KEY not set; skipping summary. "
+                f"warning: {key_name} not set; skipping summary. "
                 "Transcript files were still saved.",
                 file=sys.stderr,
             )
         else:
-            print(f"Summarizing with {args.model}...")
-            summary, usage = summarize(args.model, meta, transcript)
+            print(f"Summarizing with {args.model} ({provider})...")
+            summary, usage = summarize(
+                provider, args.model, meta, transcript, args.base_url
+            )
             (folder / "summary.md").write_text(
                 f"# {title}\n\n"
                 f"[Watch]({meta.get('webpage_url')}) · "
@@ -468,7 +603,9 @@ def main() -> None:
                 f"{summary}\n",
                 encoding="utf-8",
             )
-            cost = estimate_cost(args.model, usage)
+            cost = estimate_cost(
+                args.model, normalize_usage(provider, usage), price_override
+            )
             print("Summary saved" + (f" (~{cost})" if cost else ""))
 
     print(f"\nDone: {folder}")
