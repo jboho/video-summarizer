@@ -7,6 +7,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/jboho/video-summarizer/actions/workflows/ci.yml"><img src="https://github.com/jboho/video-summarizer/actions/workflows/ci.yml/badge.svg" alt="CI status" /></a>
   <a href="https://github.com/jboho/video-summarizer/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs welcome" /></a>
   <a href="https://docs.astral.sh/uv/"><img src="https://img.shields.io/badge/uv-script-DE5FE9.svg" alt="uv script" /></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.11+-3776AB?logo=python&logoColor=white" alt="Python 3.11+" /></a>

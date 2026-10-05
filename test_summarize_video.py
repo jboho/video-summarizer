@@ -198,7 +198,9 @@ def test_summarize_openai_passes_base_url(monkeypatch):
     events = [_sse("x"), _sse(finish_reason="stop")]
     recorder = {}
     _install_fake_openai(monkeypatch, events, recorder)
-    sv.summarize_openai("llama3", {"title": "T", "duration": 0}, "body", "http://localhost:11434/v1")
+    sv.summarize_openai(
+        "llama3", {"title": "T", "duration": 0}, "body", "http://localhost:11434/v1"
+    )
     assert recorder["base_url"] == "http://localhost:11434/v1"
 
 
