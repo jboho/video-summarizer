@@ -1,5 +1,6 @@
 import importlib
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -251,3 +252,92 @@ def test_summarize_dispatches_to_openai(monkeypatch):
     )
     text, _ = sv.summarize("openai", "gpt-4o-mini", {}, "body", "http://h/v1")
     assert called["p"] == "o" and text == "o"
+
+
+# --- main(): subtitle download failure handling ---
+
+_VTT = "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nhello there\n"
+
+
+def _run_main(monkeypatch, tmp_path, sub_rc, sub_stderr, write_vtt, extra_args=()):
+    def fake_run(cmd, **kwargs):
+        if "-J" in cmd:
+            meta = '{"title": "T", "id": "abc", "upload_date": "20260101"}'
+            return SimpleNamespace(returncode=0, stdout=meta, stderr="")
+        if write_vtt:
+            out = cmd[cmd.index("-o") + 1]
+            (Path(out).parent / "abc.en.vtt").write_text(_VTT, encoding="utf-8")
+        return SimpleNamespace(returncode=sub_rc, stdout="", stderr=sub_stderr)
+
+    monkeypatch.setattr(sv.subprocess, "run", fake_run)
+    monkeypatch.setattr(sv, "check_yt_dlp", lambda: None)
+    out_dir = tmp_path / "out"
+    argv = ["summarize_video.py", "http://x", "--no-summary", "--out", str(out_dir)]
+    monkeypatch.setattr(sys, "argv", [*argv, *extra_args])
+    return out_dir
+
+
+def _main_output(capsys):
+    with pytest.raises(SystemExit) as e:
+        sv.main()
+    assert e.value.code != 0
+    cap = capsys.readouterr()
+    return cap.out + cap.err
+
+
+def test_main_429_reports_rate_limit_not_no_captions(monkeypatch, tmp_path, capsys):
+    err = "ERROR: Unable to download video subtitles: HTTP Error 429: Too Many Requests"
+    _run_main(monkeypatch, tmp_path, 1, err, False)
+    text = _main_output(capsys)
+    assert "429" in text and "--cookies-from-browser" in text
+    assert "No captions found" not in text
+
+
+def test_main_other_ytdlp_error_shows_its_text(monkeypatch, tmp_path, capsys):
+    err = "ERROR: [Errno 8] nodename nor servname provided, or not known"
+    _run_main(monkeypatch, tmp_path, 1, err, False)
+    text = _main_output(capsys)
+    assert "nodename nor servname provided" in text
+    assert "No captions found" not in text
+
+
+def test_main_429_inside_a_video_id_is_not_a_rate_limit(monkeypatch, tmp_path, capsys):
+    err = "ERROR: [youtube] aB4296xyz12: Video unavailable"
+    _run_main(monkeypatch, tmp_path, 1, err, False)
+    text = _main_output(capsys)
+    assert "Video unavailable" in text
+    assert "rate-limited" not in text and "--cookies-from-browser" not in text
+
+
+def test_main_empty_stderr_still_reports_exit_code(monkeypatch, tmp_path, capsys):
+    _run_main(monkeypatch, tmp_path, 3, "", False)
+    text = _main_output(capsys)
+    assert "exited with 3" in text
+    assert "No captions found" not in text
+
+
+def test_main_429_hint_skipped_when_cookies_already_passed(
+    monkeypatch, tmp_path, capsys
+):
+    err = "ERROR: HTTP Error 429: Too Many Requests"
+    _run_main(
+        monkeypatch, tmp_path, 1, err, False, ["--cookies-from-browser", "chrome"]
+    )
+    text = _main_output(capsys)
+    assert "HTTP Error 429" in text
+    assert "rate-limited" not in text
+
+
+def test_main_clean_exit_no_subs_says_no_captions(monkeypatch, tmp_path, capsys):
+    _run_main(monkeypatch, tmp_path, 0, "", False)
+    text = _main_output(capsys)
+    assert "No captions found" in text
+    assert "429" not in text
+
+
+def test_main_nonzero_but_subs_written_continues(monkeypatch, tmp_path):
+    err = "ERROR: HTTP Error 429: Too Many Requests"
+    out_dir = _run_main(monkeypatch, tmp_path, 1, err, True)
+    sv.main()
+    files = {p.name for p in out_dir.rglob("*") if p.is_file()}
+    assert {"transcript.txt", "transcript.md", "metadata.json"} <= files

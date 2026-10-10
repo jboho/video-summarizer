@@ -93,6 +93,9 @@ def fetch_metadata(url: str, cookies_browser: str | None = None) -> dict:
     return json.loads(out)
 
 
+_RATE_LIMIT_RE = re.compile(r"HTTP Error 429|Too Many Requests", re.IGNORECASE)
+
+
 def download_subs(
     url: str, workdir: Path, cookies_browser: str | None = None
 ) -> Path | None:
@@ -101,7 +104,7 @@ def download_subs(
     auto-generated captions. Returns the path to the .vtt file, or None if the
     video has no captions in any English variant.
     """
-    subprocess.run(
+    proc = subprocess.run(
         [
             "yt-dlp",
             "--skip-download",
@@ -126,6 +129,17 @@ def download_subs(
     )
     vtts = sorted(workdir.glob("*.vtt"))
     if not vtts:
+        if proc.returncode != 0:
+            # A failed download is not the same as a video without captions.
+            err = (proc.stderr or "").strip() or f"yt-dlp exited with {proc.returncode}"
+            hint = ""
+            # Match yt-dlp's wording, not a bare "429": video IDs can contain it.
+            if _RATE_LIMIT_RE.search(err) and not cookies_browser:
+                hint = (
+                    "\nYouTube rate-limited the request (HTTP 429). Retry later or "
+                    "pass --cookies-from-browser BROWSER (e.g. chrome)."
+                )
+            die(f"yt-dlp failed to download subtitles:\n{err}{hint}")
         return None
     # Prefer a plain "en" track over region/auto variants when several exist.
     for v in vtts:
