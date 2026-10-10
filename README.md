@@ -73,6 +73,7 @@ Then: `vidsum "https://youtu.be/..."`
 | `--price-in N` / `--price-out N`   | Cost-estimate override in dollars per 1M input / output tokens, for models not in the built-in price table. Both are required; one alone is ignored. |
 | `--out DIR`                        | Output directory. Default `~/Documents/video-summaries`.                                                                                    |
 | `--no-summary`                     | Fetch and format the transcript only; skip the model call (no cost).                                                                        |
+| `--cookies-from-browser BROWSER`   | Send that browser's cookies to yt-dlp (e.g. `chrome`). Use when YouTube answers with HTTP 429 and the tool wrongly reports "No captions found". |
 
 Environment overrides: `VIDEO_SUMMARY_MODEL`, `VIDEO_SUMMARY_DIR`.
 
