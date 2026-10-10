@@ -67,11 +67,23 @@ def check_yt_dlp() -> None:
         die("yt-dlp not found on PATH. Install it with: brew install yt-dlp")
 
 
-def fetch_metadata(url: str) -> dict:
+def _cookie_args(browser: str | None) -> list[str]:
+    """yt-dlp args to send a browser's cookies (helps when YouTube returns 429)."""
+    return ["--cookies-from-browser", browser] if browser else []
+
+
+def fetch_metadata(url: str, cookies_browser: str | None = None) -> dict:
     """Get video metadata as a dict via yt-dlp -J (no download)."""
     try:
         out = subprocess.run(
-            ["yt-dlp", "-J", "--skip-download", "--no-warnings", url],
+            [
+                "yt-dlp",
+                "-J",
+                "--skip-download",
+                "--no-warnings",
+                *_cookie_args(cookies_browser),
+                url,
+            ],
             capture_output=True,
             text=True,
             check=True,
@@ -81,7 +93,9 @@ def fetch_metadata(url: str) -> dict:
     return json.loads(out)
 
 
-def download_subs(url: str, workdir: Path) -> Path | None:
+def download_subs(
+    url: str, workdir: Path, cookies_browser: str | None = None
+) -> Path | None:
     """
     Download subtitles as VTT. Prefers manual English subs; falls back to
     auto-generated captions. Returns the path to the .vtt file, or None if the
@@ -101,6 +115,7 @@ def download_subs(url: str, workdir: Path) -> Path | None:
             "--convert-subs",
             "vtt",
             "--no-warnings",
+            *_cookie_args(cookies_browser),
             "-o",
             str(workdir / "%(id)s.%(ext)s"),
             url,
@@ -499,6 +514,12 @@ def main() -> None:
         action="store_true",
         help="Fetch and format the transcript only; skip the Claude summary.",
     )
+    ap.add_argument(
+        "--cookies-from-browser",
+        metavar="BROWSER",
+        help="Send this browser's cookies to yt-dlp (e.g. chrome). "
+        "Use when YouTube returns HTTP 429.",
+    )
     args = ap.parse_args()
 
     provider = resolve_provider(args.model, args.provider, args.base_url)
@@ -511,14 +532,14 @@ def main() -> None:
     check_yt_dlp()
 
     print("Fetching video details...")
-    meta = fetch_metadata(args.url)
+    meta = fetch_metadata(args.url, args.cookies_from_browser)
     title = meta.get("title") or meta.get("id") or "video"
     print(f"  {title}")
 
     with tempfile.TemporaryDirectory() as td:
         workdir = Path(td)
         print("Downloading transcript...")
-        vtt = download_subs(args.url, workdir)
+        vtt = download_subs(args.url, workdir, args.cookies_from_browser)
         if vtt is None:
             die(
                 "No captions found for this video. This tool reads existing "
