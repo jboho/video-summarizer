@@ -11,6 +11,10 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -19,4 +23,4 @@ jobs:
       - name: Format check
         run: uvx ruff format --check .
       - name: Test
-        run: uv run --python 3.11 --with pytest --with anthropic --with openai pytest -q
+        run: uv run --python ${{ matrix.python-version }} --with pytest --with anthropic --with openai pytest -q
