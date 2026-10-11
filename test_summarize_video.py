@@ -1,14 +1,34 @@
 import importlib
 import importlib.util
 import json
+import os
 import re
+import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 sv = importlib.import_module("summarize_video")
+
+_ENV_VARS = (
+    "VIDEO_SUMMARY_DIR",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "VIDEO_SUMMARY_MODEL",
+    "VIDEO_SUMMARY_SECTIONS",
+)
+
+
+@pytest.fixture(autouse=True)
+def _clean_env(monkeypatch):
+    for name in _ENV_VARS:
+        # setenv first so teardown restores the original even if main() sets it.
+        monkeypatch.setenv(name, "x")
+        monkeypatch.delenv(name)
 
 
 def test_resolve_provider_infers_anthropic_from_claude_model(monkeypatch):
@@ -308,13 +328,24 @@ def test_summarize_dispatches_to_openai(monkeypatch):
 _VTT = "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nhello there\n"
 
 
+_DEFAULT_META = {"title": "T", "id": "abc", "upload_date": "20260101"}
+
+
 def _run_main(
-    monkeypatch, tmp_path, sub_rc, sub_stderr, write_vtt, extra_args=(), summary=False
+    monkeypatch,
+    tmp_path,
+    sub_rc,
+    sub_stderr,
+    write_vtt,
+    extra_args=(),
+    summary=False,
+    meta=None,
 ):
+    meta_json = json.dumps(_DEFAULT_META if meta is None else meta)
+
     def fake_run(cmd, **kwargs):
         if "-J" in cmd:
-            meta = '{"title": "T", "id": "abc", "upload_date": "20260101"}'
-            return SimpleNamespace(returncode=0, stdout=meta, stderr="")
+            return SimpleNamespace(returncode=0, stdout=meta_json, stderr="")
         if write_vtt:
             out = cmd[cmd.index("-o") + 1]
             (Path(out).parent / "abc.en.vtt").write_text(_VTT, encoding="utf-8")
@@ -545,14 +576,21 @@ def test_env_var_sets_default_sections(monkeypatch):
 # --- main(): summary run, end to end with fakes ---
 
 
-def _run_summary_main(monkeypatch, tmp_path, extra_args=()):
+def _run_summary_main(
+    monkeypatch, tmp_path, extra_args=(), meta=None, usage=None, model="claude-sonnet-5"
+):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     calls = {}
 
     def fake_summarize(provider, model, meta, transcript, base_url, sections=None):
-        calls.update(provider=provider, model=model, sections=sections)
-        return "SUMMARY BODY", None
+        calls.update(
+            provider=provider,
+            model=model,
+            sections=sections,
+            base_url=base_url,
+            openai_key=os.environ.get("OPENAI_API_KEY"),
+        )
+        return "SUMMARY BODY", usage
 
     monkeypatch.setattr(sv, "summarize", fake_summarize)
     out_dir = _run_main(
@@ -561,8 +599,9 @@ def _run_summary_main(monkeypatch, tmp_path, extra_args=()):
         0,
         "",
         True,
-        ["--model", "claude-sonnet-5", *extra_args],
+        ["--model", model, *extra_args],
         summary=True,
+        meta=meta,
     )
     sv.main()
     folder = next(out_dir.iterdir())
@@ -661,3 +700,625 @@ def test_man_page_documents_every_flag(monkeypatch, capsys):
 def test_man_page_version_matches_code():
     first_line = MAN_PAGE.read_text(encoding="utf-8").splitlines()[0]
     assert f"video-summarizer {sv.__version__}" in first_line
+
+
+# --- mutation-hardening: provider, pricing, prompt plumbing ---
+
+
+def test_resolve_provider_explicit_anthropic_beats_non_claude_model():
+    assert sv.resolve_provider("gpt-4o", "anthropic", None) == "anthropic"
+
+
+def test_resolve_provider_auto_is_compared_by_value():
+    auto = "".join(["au", "to"])
+    assert sv.resolve_provider("claude-sonnet-5", auto, None) == "anthropic"
+    assert sv.resolve_provider("gpt-4o", auto, None) == "openai"
+
+
+def test_prices_table_is_exact():
+    assert sv.PRICES == {
+        "claude-opus-5": (5.0, 25.0),
+        "claude-sonnet-5": (2.0, 10.0),
+        "claude-haiku-4-5": (1.0, 5.0),
+        "gpt-4o": (2.5, 10.0),
+        "gpt-4o-mini": (0.15, 0.6),
+        "gpt-4.1-mini": (0.4, 1.6),
+    }
+
+
+def test_estimate_cost_every_priced_model_with_uneven_counts():
+    tin, tout = 1_234_567, 7_654
+    for model, (pin, pout) in sv.PRICES.items():
+        want = (tin * pin + tout * pout) / 1_000_000
+        assert sv.estimate_cost(model, (tin, tout), None) == (
+            f"${want:.3f} ({tin} in / {tout} out)"
+        ), model
+    assert sv.estimate_cost("claude-sonnet-5", (tin, tout), None) == (
+        "$2.546 (1234567 in / 7654 out)"
+    )
+
+
+def test_estimate_cost_divides_by_exactly_one_million():
+    # 1500 and 4500 tokens sit on rounding boundaries that a divisor of
+    # 1_000_001 or 999_999 would tip the other way.
+    assert sv.estimate_cost("m", (1500, 0), (1.0, 0.0)) == "$0.002 (1500 in / 0 out)"
+    assert sv.estimate_cost("m", (4500, 0), (1.0, 0.0)) == "$0.004 (4500 in / 0 out)"
+
+
+def test_summarize_anthropic_ignores_non_text_blocks(monkeypatch):
+    content = [
+        SimpleNamespace(type="thinking", thinking="hmm"),
+        SimpleNamespace(type="text", text="  the answer "),
+        SimpleNamespace(type="redacted_thinking", data="zz"),
+        SimpleNamespace(type="tool_use", id="t"),
+    ]
+    response = SimpleNamespace(stop_reason="end_turn", content=content, usage=None)
+    _install_fake_anthropic(monkeypatch, response, {})
+    text, _ = sv.summarize_anthropic("claude-sonnet-5", {}, "body")
+    assert text == "the answer"
+
+
+@pytest.mark.parametrize(
+    "reason", ["end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn"]
+)
+def test_summarize_anthropic_only_refusal_exits(monkeypatch, reason):
+    response = SimpleNamespace(
+        stop_reason=reason,
+        content=[SimpleNamespace(type="text", text="ok")],
+        usage=None,
+    )
+    _install_fake_anthropic(monkeypatch, response, {})
+    assert sv.summarize_anthropic("claude-sonnet-5", {}, "body")[0] == "ok"
+
+
+def test_summarize_anthropic_refusal_message_names_category(monkeypatch, capsys):
+    response = SimpleNamespace(
+        stop_reason="refusal",
+        stop_details=SimpleNamespace(category="weapons"),
+        content=[],
+        usage=None,
+    )
+    _install_fake_anthropic(monkeypatch, response, {})
+    with pytest.raises(SystemExit):
+        sv.summarize_anthropic("claude-sonnet-5", {}, "body")
+    assert "category: weapons" in capsys.readouterr().err
+
+
+def test_summarize_anthropic_refusal_without_details(monkeypatch, capsys):
+    response = SimpleNamespace(stop_reason="refusal", content=[], usage=None)
+    _install_fake_anthropic(monkeypatch, response, {})
+    with pytest.raises(SystemExit):
+        sv.summarize_anthropic("claude-sonnet-5", {}, "body")
+    assert "category: None" in capsys.readouterr().err
+
+
+def test_summarize_anthropic_request_parameters(monkeypatch):
+    response = SimpleNamespace(
+        stop_reason="end_turn",
+        content=[SimpleNamespace(type="text", text="ok")],
+        usage=None,
+    )
+    recorder = {}
+    _install_fake_anthropic(monkeypatch, response, recorder)
+    sv.summarize_anthropic("claude-opus-5", {}, "body")
+    assert recorder["model"] == "claude-opus-5"
+    assert recorder["max_tokens"] == 16000
+    assert recorder["thinking"] == {"type": "adaptive"}
+
+
+def test_summarize_openai_request_parameters(monkeypatch):
+    recorder = {}
+    _install_fake_openai(monkeypatch, [_sse("x"), _sse(finish_reason="stop")], recorder)
+    sv.summarize_openai("gpt-4o-mini", {}, "body", None)
+    assert recorder["model"] == "gpt-4o-mini"
+    assert recorder["max_tokens"] == 16000
+    assert recorder["stream"] is True
+    assert recorder["stream_options"] == {"include_usage": True}
+
+
+def test_summarize_openai_reads_base_url_from_env(monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://env-host/v1")
+    recorder = {}
+    _install_fake_openai(monkeypatch, [_sse("x")], recorder)
+    sv.summarize_openai("llama3", {}, "body", None)
+    assert recorder["base_url"] == "http://env-host/v1"
+
+
+def test_summarize_openai_arg_base_url_beats_env(monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://env-host/v1")
+    recorder = {}
+    _install_fake_openai(monkeypatch, [_sse("x")], recorder)
+    sv.summarize_openai("llama3", {}, "body", "http://arg-host/v1")
+    assert recorder["base_url"] == "http://arg-host/v1"
+
+
+def test_summarize_openai_empty_env_base_url_is_none(monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "")
+    recorder = {}
+    _install_fake_openai(monkeypatch, [_sse("x")], recorder)
+    sv.summarize_openai("gpt-4o-mini", {}, "body", None)
+    assert recorder["base_url"] is None
+
+
+def test_summarize_openai_stream_without_finish_reason(monkeypatch):
+    events = [_sse("part one "), _sse("part two"), _usage_event(1, 2)]
+    _install_fake_openai(monkeypatch, events, {})
+    text, usage = sv.summarize_openai("gpt-4o-mini", {}, "body", None)
+    assert text == "part one part two"
+    assert usage.completion_tokens == 2
+
+
+# --- mutation-hardening: prompt and transcript text ---
+
+
+def test_parse_sections_error_names_unknown_sections(capsys):
+    with pytest.raises(SystemExit):
+        sv.parse_sections("tldr,nope,zip")
+    err = capsys.readouterr().err
+    assert "(unknown: nope, zip)" in err
+    assert "(unknown: tldr" not in err
+
+
+def test_parse_sections_empty_error_has_no_unknown_clause(capsys):
+    with pytest.raises(SystemExit):
+        sv.parse_sections(" , ")
+    assert "unknown" not in capsys.readouterr().err
+
+
+def test_build_user_content_channel_prefers_uploader():
+    out = sv.build_user_content({"uploader": "U", "channel": "C"}, "body")
+    assert "Channel: U\n" in out
+
+
+def test_build_user_content_channel_falls_back_to_channel():
+    out = sv.build_user_content({"channel": "Chan"}, "body")
+    assert "Channel: Chan\n" in out
+
+
+def test_build_user_content_missing_metadata():
+    out = sv.build_user_content({}, "body")
+    assert "Channel: None\n" in out
+    assert "Duration: 00:00:00\n" in out
+
+
+def test_build_transcript_md_header_without_metadata():
+    out = sv.build_transcript_md({}, [(1.0, "hi")])
+    assert out.startswith("# Video\n\n[Watch]() \u00b7  \u00b7 00:00:00\n")
+
+
+def test_build_transcript_md_title_falls_back_to_id():
+    assert sv.build_transcript_md({"id": "abc"}, []).startswith("# abc\n")
+
+
+def test_build_transcript_md_channel_fallback():
+    only_channel = sv.build_transcript_md({"channel": "Chan"}, [])
+    assert "\u00b7 Chan \u00b7" in only_channel
+    both = sv.build_transcript_md({"uploader": "U", "channel": "C"}, [])
+    assert "\u00b7 U \u00b7" in both
+
+
+def _chapter_sections(md):
+    parts = re.split(r"^## ", md, flags=re.M)
+    return {p.split("\n")[0]: p for p in parts[1:]}
+
+
+def test_chapter_slicing_is_start_inclusive_end_exclusive():
+    meta = {
+        "title": "T",
+        "chapters": [
+            {"start_time": 5, "end_time": 10, "title": "A"},
+            {"start_time": 10, "end_time": 20, "title": "B"},
+        ],
+    }
+    segs = [(1.0, "before"), (5.0, "at-a"), (10.0, "at-b"), (15.0, "mid-b")]
+    out = sv.build_transcript_md(meta, segs)
+    assert "before" not in "".join(_chapter_sections(out).values())
+    sections = _chapter_sections(out)
+    a, b = sections["[00:00:05] A"], sections["[00:00:10] B"]
+    assert "at-a" in a and "at-b" not in a
+    assert "at-b" in b and "mid-b" in b and "at-a" not in b
+
+
+# --- mutation-hardening: format_transcript / group_paragraphs ---
+
+
+def test_format_transcript_no_marker_just_under_thirty_seconds():
+    assert sv.format_transcript([(0.0, "a"), (29.0, "b")]) == "[00:00:00]\na b\n"
+
+
+def test_group_paragraphs_default_soft_limit_is_seventy_words():
+    segs = [(i, "w.") for i in range(75)]
+    got = sv.group_paragraphs(segs)
+    assert len(got[0][1].split()) == 70
+
+
+def test_group_paragraphs_default_hard_limit_is_110_words():
+    segs = [(i, "w") for i in range(120)]
+    got = sv.group_paragraphs(segs)
+    assert len(got[0][1].split()) == 110
+
+
+def test_group_paragraphs_breaks_at_exactly_soft_words():
+    segs = [(0, "a"), (1, "b."), (2, "c")]
+    got = sv.group_paragraphs(segs, soft_words=2, hard_words=100)
+    assert got == [(0, "a b."), (2, "c")]
+
+
+def test_group_paragraphs_no_break_before_soft_words():
+    segs = [(0, "a."), (1, "b"), (2, "c")]
+    got = sv.group_paragraphs(segs, soft_words=2, hard_words=100)
+    assert got == [(0, "a. b c")]
+
+
+def test_group_paragraphs_breaks_at_exactly_hard_words():
+    segs = [(0, "a b"), (2, "c"), (4, "d")]
+    got = sv.group_paragraphs(segs, soft_words=100, hard_words=3)
+    assert got == [(0, "a b c"), (4, "d")]
+
+
+def test_parse_vtt_skips_cue_less_block_and_leading_blank_lines(tmp_path):
+    vtt = _vtt(
+        tmp_path,
+        "\n\nWEBVTT\n\nstray text with no timing\n\n"
+        "00:00:01.000 --> 00:00:02.000\nhello\n",
+    )
+    assert sv.parse_vtt(vtt) == [(1.0, "hello")]
+
+
+def test_parse_vtt_tag_only_line_is_skipped_not_terminal(tmp_path):
+    vtt = _vtt(
+        tmp_path,
+        "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n<c></c>\nreal text\n",
+    )
+    assert sv.parse_vtt(vtt) == [(1.0, "real text")]
+
+
+def test_parse_vtt_repeated_first_line_then_new_text(tmp_path):
+    vtt = _vtt(
+        tmp_path,
+        "WEBVTT\n\n"
+        "00:00:01.000 --> 00:00:02.000\none\n\n"
+        "00:00:02.000 --> 00:00:03.000\none\ntwo\nthree\n",
+    )
+    assert sv.parse_vtt(vtt) == [(1.0, "one"), (2.0, "two"), (2.0, "three")]
+
+
+# --- mutation-hardening: yt-dlp wrappers ---
+
+
+def test_check_yt_dlp_dies_when_missing(monkeypatch, capsys):
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    with pytest.raises(SystemExit) as e:
+        sv.check_yt_dlp()
+    assert e.value.code == 1
+    assert "yt-dlp not found" in capsys.readouterr().err
+
+
+def test_check_yt_dlp_passes_when_present(monkeypatch):
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/yt-dlp")
+    assert sv.check_yt_dlp() is None
+
+
+def test_cookie_args():
+    assert sv._cookie_args("chrome") == ["--cookies-from-browser", "chrome"]
+    assert sv._cookie_args(None) == []
+    assert sv._cookie_args("") == []
+
+
+def test_fetch_metadata_runs_ytdlp_and_parses_json(monkeypatch):
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen.update(cmd=cmd, kwargs=kwargs)
+        return SimpleNamespace(stdout='{"title": "T"}')
+
+    monkeypatch.setattr(sv.subprocess, "run", fake_run)
+    assert sv.fetch_metadata("http://x", "firefox") == {"title": "T"}
+    assert seen["kwargs"] == {"capture_output": True, "text": True, "check": True}
+    assert seen["cmd"][0] == "yt-dlp" and seen["cmd"][-1] == "http://x"
+    assert "--cookies-from-browser" in seen["cmd"] and "firefox" in seen["cmd"]
+
+
+def test_fetch_metadata_dies_with_ytdlp_stderr(monkeypatch, capsys):
+    def fake_run(cmd, **kwargs):
+        raise subprocess.CalledProcessError(1, cmd, stderr="  Video unavailable\n")
+
+    monkeypatch.setattr(sv.subprocess, "run", fake_run)
+    with pytest.raises(SystemExit) as e:
+        sv.fetch_metadata("http://x")
+    assert e.value.code == 1
+    err = capsys.readouterr().err
+    assert "could not read the video" in err and "Video unavailable" in err
+
+
+def _fake_subs_run(monkeypatch, tmp_path, names, returncode=0, stderr=""):
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen.update(cmd=cmd, kwargs=kwargs)
+        for n in names:
+            (tmp_path / n).write_text(_VTT, encoding="utf-8")
+        return SimpleNamespace(returncode=returncode, stdout="", stderr=stderr)
+
+    monkeypatch.setattr(sv.subprocess, "run", fake_run)
+    return seen
+
+
+def test_download_subs_run_options(monkeypatch, tmp_path):
+    seen = _fake_subs_run(monkeypatch, tmp_path, ["abc.en.vtt"])
+    assert sv.download_subs("http://x", tmp_path, "chrome") == tmp_path / "abc.en.vtt"
+    assert seen["kwargs"] == {"capture_output": True, "text": True, "check": False}
+    assert "chrome" in seen["cmd"]
+
+
+def test_download_subs_prefers_plain_en_over_variants(monkeypatch, tmp_path):
+    names = ["abc.en-US.vtt", "abc.en-orig.vtt", "abc.en.vtt"]
+    _fake_subs_run(monkeypatch, tmp_path, names)
+    assert sv.download_subs("http://x", tmp_path).name == "abc.en.vtt"
+
+
+def test_download_subs_without_plain_en_returns_first_sorted(monkeypatch, tmp_path):
+    _fake_subs_run(monkeypatch, tmp_path, ["abc.en-orig.vtt", "abc.en-US.vtt"])
+    assert sv.download_subs("http://x", tmp_path).name == "abc.en-US.vtt"
+
+
+def test_download_subs_single_non_plain_track(monkeypatch, tmp_path):
+    _fake_subs_run(monkeypatch, tmp_path, ["abc.en-GB.vtt"])
+    assert sv.download_subs("http://x", tmp_path).name == "abc.en-GB.vtt"
+
+
+def test_download_subs_signal_exit_without_files_dies(monkeypatch, tmp_path, capsys):
+    _fake_subs_run(monkeypatch, tmp_path, [], returncode=-9)
+    with pytest.raises(SystemExit):
+        sv.download_subs("http://x", tmp_path)
+    assert "exited with -9" in capsys.readouterr().err
+
+
+def test_download_subs_clean_exit_without_files_is_none(monkeypatch, tmp_path):
+    _fake_subs_run(monkeypatch, tmp_path, [])
+    assert sv.download_subs("http://x", tmp_path) is None
+
+
+# --- mutation-hardening: main() output and metadata ---
+
+
+def _read_info(folder):
+    return json.loads((folder / "metadata.json").read_text(encoding="utf-8"))
+
+
+def _run_no_summary(monkeypatch, tmp_path, meta):
+    out_dir = _run_main(monkeypatch, tmp_path, 0, "", True, meta=meta)
+    sv.main()
+    return next(out_dir.iterdir())
+
+
+def test_folder_name_uses_upload_date_and_title_slug(monkeypatch, tmp_path):
+    meta = {"title": "Hello World", "id": "abc", "upload_date": "20240315"}
+    folder = _run_no_summary(monkeypatch, tmp_path, meta)
+    assert folder.name == "2024-03-15_hello-world"
+    assert _read_info(folder)["upload_date"] == "2024-03-15"
+
+
+class _FixedDatetime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2030, 5, 6, 7, 8, 9, tzinfo=tz)
+
+
+@pytest.mark.parametrize("upload", [None, "", "2024031", "202403155"])
+def test_folder_name_falls_back_to_today(monkeypatch, tmp_path, upload):
+    monkeypatch.setattr(sv, "datetime", _FixedDatetime)
+    meta = {"title": "T", "id": "abc"}
+    if upload is not None:
+        meta["upload_date"] = upload
+    folder = _run_no_summary(monkeypatch, tmp_path, meta)
+    assert folder.name == "2030-05-06_t"
+
+
+def test_main_can_rerun_into_existing_folder(monkeypatch, tmp_path):
+    out_dir = _run_main(monkeypatch, tmp_path, 0, "", True)
+    sv.main()
+    sv.main()
+    assert len(list(out_dir.iterdir())) == 1
+
+
+def test_main_title_falls_back_to_id_then_video(monkeypatch, tmp_path, capsys):
+    folder = _run_no_summary(monkeypatch, tmp_path, {"id": "vid42"})
+    assert folder.name.endswith("_vid42")
+    assert _read_info(folder)["title"] == "vid42"
+    assert "\n  vid42\n" in capsys.readouterr().out
+
+
+def test_main_title_wins_over_id(monkeypatch, tmp_path):
+    folder = _run_no_summary(monkeypatch, tmp_path, {"title": "T", "id": "vid42"})
+    assert _read_info(folder)["title"] == "T"
+
+
+def test_main_title_falls_back_to_video_without_id(monkeypatch, tmp_path):
+    folder = _run_no_summary(monkeypatch, tmp_path, {"upload_date": "20240101"})
+    assert folder.name == "2024-01-01_video"
+    assert _read_info(folder)["title"] == "video"
+
+
+def test_main_metadata_without_optional_fields(monkeypatch, tmp_path):
+    info = _read_info(_run_no_summary(monkeypatch, tmp_path, {"title": "T"}))
+    assert info["channel"] is None
+    assert info["duration_seconds"] is None
+    assert info["duration"] == "00:00:00"
+    assert info["video_id"] is None
+
+
+def test_main_metadata_channel_and_duration(monkeypatch, tmp_path):
+    both = {"title": "T", "uploader": "U", "channel": "C", "duration": 3725}
+    info = _read_info(_run_no_summary(monkeypatch, tmp_path, both))
+    assert info["channel"] == "U"
+    assert info["duration"] == "01:02:05"
+    only_channel = {"title": "T", "channel": "C"}
+    info = _read_info(_run_no_summary(monkeypatch, tmp_path / "b", only_channel))
+    assert info["channel"] == "C"
+
+
+def test_main_metadata_keeps_non_ascii_and_two_space_indent(monkeypatch, tmp_path):
+    folder = _run_no_summary(monkeypatch, tmp_path, {"title": "Caf\u00e9 \u2615"})
+    raw = (folder / "metadata.json").read_text(encoding="utf-8")
+    assert '"title": "Caf\u00e9 \u2615"' in raw
+    assert raw.startswith('{\n  "tool_version"')
+
+
+def test_main_counts_only_chapters_with_a_start_time(monkeypatch, tmp_path, capsys):
+    meta = {
+        "title": "T",
+        "chapters": [
+            {"start_time": 0, "end_time": 5, "title": "One"},
+            {"start_time": 5, "title": "Two"},
+            {"start_time": None, "title": "Ghost"},
+        ],
+    }
+    folder = _run_no_summary(monkeypatch, tmp_path, meta)
+    assert _read_info(folder)["chapters"] == 2
+    assert "Transcript saved: 1 segments, 2 chapters\n" in capsys.readouterr().out
+    assert "Ghost" not in (folder / "transcript.md").read_text(encoding="utf-8")
+
+
+def test_main_reports_no_chapters(monkeypatch, tmp_path, capsys):
+    folder = _run_no_summary(monkeypatch, tmp_path, {"title": "T"})
+    assert _read_info(folder)["chapters"] == 0
+    assert "Transcript saved: 1 segments, no chapters\n" in capsys.readouterr().out
+
+
+def test_main_records_summary_model_only_when_summarizing(monkeypatch, tmp_path):
+    folder = _run_no_summary(monkeypatch, tmp_path, {"title": "T"})
+    assert _read_info(folder)["summary_model"] is None
+    assert _read_info(folder)["summary_provider"] is None
+
+
+def test_main_summary_run_records_model(monkeypatch, tmp_path):
+    folder, _ = _run_summary_main(monkeypatch, tmp_path)
+    assert _read_info(folder)["summary_model"] == "claude-sonnet-5"
+
+
+def test_main_summary_line_shows_cost_when_usage_present(monkeypatch, tmp_path, capsys):
+    usage = SimpleNamespace(input_tokens=1_000_000, output_tokens=1_000_000)
+    _run_summary_main(monkeypatch, tmp_path, usage=usage)
+    out = capsys.readouterr().out
+    assert "Summary saved (~$12.000 (1000000 in / 1000000 out))\n" in out
+
+
+def test_main_summary_line_has_no_cost_without_usage(monkeypatch, tmp_path, capsys):
+    _run_summary_main(monkeypatch, tmp_path)
+    assert "Summary saved\n" in capsys.readouterr().out
+
+
+def test_main_price_override_needs_both_flags(monkeypatch, tmp_path, capsys):
+    usage = SimpleNamespace(input_tokens=1_000_000, output_tokens=1_000_000)
+    args = ["--provider", "anthropic", "--price-in", "1.5", "--price-out", "2.5"]
+    _run_summary_main(monkeypatch, tmp_path, args, usage=usage, model="mystery")
+    assert "Summary saved (~$4.000 (1000000 in / 1000000 out))\n" in (
+        capsys.readouterr().out
+    )
+
+
+@pytest.mark.parametrize("flag", ["--price-in", "--price-out"])
+def test_main_single_price_flag_is_ignored(monkeypatch, tmp_path, capsys, flag):
+    usage = SimpleNamespace(input_tokens=1_000_000, output_tokens=1_000_000)
+    args = ["--provider", "anthropic", flag, "1.5"]
+    _run_summary_main(monkeypatch, tmp_path, args, usage=usage, model="mystery")
+    assert "Summary saved\n" in capsys.readouterr().out
+
+
+# --- mutation-hardening: API key and base URL handling in main() ---
+
+
+def test_main_base_url_flag_sets_placeholder_key(monkeypatch, tmp_path):
+    args = ["--base-url", "http://localhost:11434/v1"]
+    _, calls = _run_summary_main(monkeypatch, tmp_path, args, model="llama3")
+    assert calls["provider"] == "openai"
+    assert calls["openai_key"] == "not-needed"
+
+
+def test_main_env_base_url_sets_placeholder_key(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
+    _, calls = _run_summary_main(monkeypatch, tmp_path, model="llama3")
+    assert calls["openai_key"] == "not-needed"
+
+
+def test_main_real_openai_key_is_not_overwritten(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-real")
+    args = ["--base-url", "http://localhost:11434/v1"]
+    _, calls = _run_summary_main(monkeypatch, tmp_path, args, model="llama3")
+    assert calls["openai_key"] == "sk-real"
+
+
+def test_main_no_placeholder_without_base_url(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(sv, "summarize", lambda *a, **k: pytest.fail("called"))
+    out_dir = _run_main(
+        monkeypatch,
+        tmp_path,
+        0,
+        "",
+        True,
+        ["--provider", "openai", "--model", "gpt-4o-mini"],
+        summary=True,
+    )
+    sv.main()
+    assert "OPENAI_API_KEY not set" in capsys.readouterr().err
+    assert "OPENAI_API_KEY" not in os.environ
+    assert not (next(out_dir.iterdir()) / "summary.md").exists()
+
+
+def test_main_openai_provider_checks_openai_key_not_anthropic(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setattr(sv, "summarize", lambda *a, **k: pytest.fail("called"))
+    out_dir = _run_main(
+        monkeypatch,
+        tmp_path,
+        0,
+        "",
+        True,
+        ["--provider", "openai", "--model", "gpt-4o-mini"],
+        summary=True,
+    )
+    sv.main()
+    assert "OPENAI_API_KEY not set" in capsys.readouterr().err
+    assert not (next(out_dir.iterdir()) / "summary.md").exists()
+
+
+def test_main_anthropic_end_to_end_with_provider_flag(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    response = SimpleNamespace(
+        stop_reason="end_turn",
+        content=[SimpleNamespace(type="text", text="REAL BODY")],
+        usage=SimpleNamespace(input_tokens=1_000_000, output_tokens=0),
+    )
+    _install_fake_anthropic(monkeypatch, response, {})
+    provider = "".join(["anthro", "pic"])
+    out_dir = _run_main(
+        monkeypatch,
+        tmp_path,
+        0,
+        "",
+        True,
+        ["--provider", provider, "--model", "claude-sonnet-5"],
+        summary=True,
+    )
+    sv.main()
+    folder = next(out_dir.iterdir())
+    assert "REAL BODY" in (folder / "summary.md").read_text(encoding="utf-8")
+    assert "(~$2.000 (1000000 in / 0 out))" in capsys.readouterr().out
+
+
+# --- mutation-hardening: script entry point ---
+
+
+def test_script_version_flag_runs_as_a_program():
+    proc = subprocess.run(
+        [sys.executable, sv.__file__, "--version"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode == 0
+    assert sv.__version__ in proc.stdout
