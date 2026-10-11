@@ -33,6 +33,8 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
+__version__ = "0.2.0"
+
 # Default model. Override per-run with --model or the VIDEO_SUMMARY_MODEL env var.
 # Sonnet is the default: cheaper and plenty for summarization. Use
 # --model claude-opus-5 when a video needs sharper reasoning.
@@ -340,31 +342,78 @@ SUMMARY_SYSTEM = (
     "accurate to what was actually said; do not invent details."
 )
 
-SUMMARY_INSTRUCTIONS = """\
-Write a summary of this video transcript as Markdown with these sections:
-
+# One instruction block per summary section, in output order. --sections picks a
+# subset; the order here always wins over the order the user typed.
+SECTION_PROMPTS = {
+    "tldr": """\
 ## TL;DR
 Two or three sentences capturing the whole video.
-
+""",
+    "actionable": """\
+## Actionable summary
+The part a viewer would act on, in the form that fits the video:
+- A list video ("5 supplements you need"): a numbered list of every item, each
+  named specifically, with the reason, dose or detail the speaker gave.
+- A how-to: any prerequisites or materials first, then numbered steps in
+  order. Include the tools, settings, amounts and commands mentioned, so the
+  steps could be turned into an implementation plan.
+- A ranking or comparison: a list from best to worst, each with a one-line
+  reason, and the criteria used if the speaker stated them.
+- Anything else (opinion, news, explainer): the specific conclusions or
+  recommendations, stated plainly.
+Name the actual things. Write "magnesium glycinate, 200-400 mg before bed",
+not "the speaker recommends a few supplements". Include only what the video
+says. If it has nothing actionable, write one line saying so.
+""",
+    "key-points": """\
 ## Key points
 The main points as bullets, in the order they come up. Add a [HH:MM:SS]
 marker to a bullet when it clearly maps to one spot.
-
+""",
+    "walkthrough": """\
 ## Section walkthrough
 The video broken into its natural segments. For each: a [HH:MM:SS] range or
 start marker, a short heading, and one or two sentences on what it covers.
-
-## Takeaways
-What a viewer should remember or act on. Skip this section if the video has no
-clear takeaways.
-
+""",
+    "quotes": """\
 ## Notable quotes
 Up to five short, verbatim quotes worth keeping, each with its [HH:MM:SS]
 marker. Skip this section if nothing stands out.
-"""
+""",
+}
+
+DEFAULT_SECTIONS = os.environ.get(
+    "VIDEO_SUMMARY_SECTIONS", "tldr,actionable,key-points,walkthrough"
+)
 
 
-def build_user_content(meta: dict, transcript: str) -> str:
+def parse_sections(value: str) -> list[str]:
+    """Turn a comma-separated list (or 'all') into section names in prompt order."""
+    names = [n.strip().lower() for n in value.split(",") if n.strip()]
+    if names == ["all"]:
+        return list(SECTION_PROMPTS)
+    unknown = [n for n in names if n not in SECTION_PROMPTS]
+    if unknown or not names:
+        die(
+            f"invalid --sections value {value!r}"
+            + (f" (unknown: {', '.join(unknown)})" if unknown else "")
+            + f". Valid names: {', '.join(SECTION_PROMPTS)}, or 'all'."
+        )
+    return [n for n in SECTION_PROMPTS if n in names]
+
+
+def build_instructions(sections: list[str] | None = None) -> str:
+    chosen = sections or parse_sections(DEFAULT_SECTIONS)
+    body = "\n".join(SECTION_PROMPTS[n] for n in chosen)
+    return (
+        "Write a summary of this video transcript as Markdown with these "
+        f"sections:\n\n{body}"
+    )
+
+
+def build_user_content(
+    meta: dict, transcript: str, sections: list[str] | None = None
+) -> str:
     header = (
         f"Title: {meta.get('title')}\n"
         f"Channel: {meta.get('uploader') or meta.get('channel')}\n"
@@ -372,17 +421,19 @@ def build_user_content(meta: dict, transcript: str) -> str:
         f"URL: {meta.get('webpage_url')}\n"
     )
     return (
-        f"{SUMMARY_INSTRUCTIONS}\n"
+        f"{build_instructions(sections)}\n"
         f"---\nVideo details:\n{header}\n"
         f"---\nTranscript:\n\n{transcript}"
     )
 
 
-def summarize_anthropic(model: str, meta: dict, transcript: str) -> tuple[str, object]:
+def summarize_anthropic(
+    model: str, meta: dict, transcript: str, sections: list[str] | None = None
+) -> tuple[str, object]:
     import anthropic
 
     client = anthropic.Anthropic()
-    user_content = build_user_content(meta, transcript)
+    user_content = build_user_content(meta, transcript, sections)
 
     # Stream because a long transcript is a long request; get_final_message()
     # returns the assembled response. Adaptive thinking improves structure.
@@ -405,13 +456,17 @@ def summarize_anthropic(model: str, meta: dict, transcript: str) -> tuple[str, o
 
 
 def summarize_openai(
-    model: str, meta: dict, transcript: str, base_url: str | None
+    model: str,
+    meta: dict,
+    transcript: str,
+    base_url: str | None,
+    sections: list[str] | None = None,
 ) -> tuple[str, object]:
     from openai import OpenAI
 
     resolved_base = base_url or os.environ.get("OPENAI_BASE_URL") or None
     client = OpenAI(base_url=resolved_base)
-    user_content = build_user_content(meta, transcript)
+    user_content = build_user_content(meta, transcript, sections)
 
     stream = client.chat.completions.create(
         model=model,
@@ -451,11 +506,16 @@ def summarize_openai(
 
 
 def summarize(
-    provider: str, model: str, meta: dict, transcript: str, base_url: str | None
+    provider: str,
+    model: str,
+    meta: dict,
+    transcript: str,
+    base_url: str | None,
+    sections: list[str] | None = None,
 ) -> tuple[str, object]:
     if provider == "anthropic":
-        return summarize_anthropic(model, meta, transcript)
-    return summarize_openai(model, meta, transcript, base_url)
+        return summarize_anthropic(model, meta, transcript, sections)
+    return summarize_openai(model, meta, transcript, base_url, sections)
 
 
 def normalize_usage(provider: str, usage) -> tuple[int, int] | None:
@@ -524,6 +584,13 @@ def main() -> None:
         help="$ per 1M output tokens (cost override)",
     )
     ap.add_argument(
+        "--sections",
+        default=DEFAULT_SECTIONS,
+        metavar="LIST",
+        help="Comma-separated summary sections: "
+        f"{', '.join(SECTION_PROMPTS)}, or 'all'. default: {DEFAULT_SECTIONS}",
+    )
+    ap.add_argument(
         "--no-summary",
         action="store_true",
         help="Fetch and format the transcript only; skip the Claude summary.",
@@ -534,8 +601,10 @@ def main() -> None:
         help="Send this browser's cookies to yt-dlp (e.g. chrome). "
         "Use when YouTube returns HTTP 429.",
     )
+    ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = ap.parse_args()
 
+    sections = parse_sections(args.sections)
     provider = resolve_provider(args.model, args.provider, args.base_url)
     price_override = (
         (args.price_in, args.price_out)
@@ -584,6 +653,7 @@ def main() -> None:
     )
 
     run_info = {
+        "tool_version": __version__,
         "source_url": args.url,
         "title": title,
         "channel": meta.get("uploader") or meta.get("channel"),
@@ -598,6 +668,7 @@ def main() -> None:
         "chapters": len(chapters),
         "summary_model": None if args.no_summary else args.model,
         "summary_provider": None if args.no_summary else provider,
+        "summary_sections": None if args.no_summary else sections,
     }
     (folder / "metadata.json").write_text(
         json.dumps(run_info, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -629,7 +700,7 @@ def main() -> None:
         else:
             print(f"Summarizing with {args.model} ({provider})...")
             summary, usage = summarize(
-                provider, args.model, meta, transcript, args.base_url
+                provider, args.model, meta, transcript, args.base_url, sections
             )
             (folder / "summary.md").write_text(
                 f"# {title}\n\n"

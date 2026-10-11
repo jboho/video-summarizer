@@ -34,7 +34,7 @@
 
 - **Timestamped transcript** — Downloads manual English subtitles first, else auto-captions, and drops the rolling-caption duplicates YouTube produces. A `[HH:MM:SS]` marker lands every 30 seconds.
 - **Formatted Markdown transcript** — The video's chapters become headings and the text is arranged into paragraphs, each prefixed with its start time.
-- **Structured summary** — TL;DR, key points, section walkthrough, takeaways, and notable quotes, with `[HH:MM:SS]` markers back into the video.
+- **Structured summary** — TL;DR, an actionable summary (the list, steps or ranking the video gives), key points, and a section walkthrough, with `[HH:MM:SS]` markers back into the video.
 - **Multi-provider** — Claude through the Anthropic SDK by default, or any endpoint that speaks the OpenAI Chat Completions API: OpenAI, OpenRouter, or local Ollama and LM Studio.
 - **Cost estimate** — Printed after every run for models in the built-in price table; pass `--price-in` and `--price-out` for any other model.
 - **Free mode** — `--no-summary` fetches and formats the transcript only, with no API call.
@@ -72,10 +72,34 @@ Then: `vidsum "https://youtu.be/..."`
 | `--base-url URL`                   | An OpenAI-compatible endpoint (e.g. `https://openrouter.ai/api/v1`, or `http://localhost:11434/v1` for Ollama). Forces the OpenAI path.     |
 | `--price-in N` / `--price-out N`   | Cost-estimate override in dollars per 1M input / output tokens, for models not in the built-in price table. Both are required; one alone is ignored. |
 | `--out DIR`                        | Output directory. Default `~/Documents/video-summaries`.                                                                                    |
+| `--sections LIST`                  | Comma-separated summary sections: `tldr`, `actionable`, `key-points`, `walkthrough`, `quotes`, or `all`. Default `tldr,actionable,key-points,walkthrough`. Sections always come out in that order. |
 | `--no-summary`                     | Fetch and format the transcript only; skip the model call (no cost).                                                                        |
+| `--version`                        | Print the version and exit.                                                                                                                 |
 | `--cookies-from-browser BROWSER`   | Send that browser's cookies to yt-dlp (e.g. `chrome`). Use when YouTube answers with HTTP 429 and the tool wrongly reports "No captions found". |
 
-Environment overrides: `VIDEO_SUMMARY_MODEL`, `VIDEO_SUMMARY_DIR`.
+Environment overrides: `VIDEO_SUMMARY_MODEL`, `VIDEO_SUMMARY_DIR`, `VIDEO_SUMMARY_SECTIONS`.
+
+### Choosing sections
+
+```bash
+vidsum "https://youtu.be/..." --sections actionable        # just the list, steps or ranking
+vidsum "https://youtu.be/..." --sections tldr,actionable   # short version
+vidsum "https://youtu.be/..." --sections all               # everything, including quotes
+export VIDEO_SUMMARY_SECTIONS=tldr,actionable              # make a choice permanent
+```
+
+The `actionable` section adapts to the video: a numbered list for "5 things" videos, ordered steps for how-tos, a best-to-worst list for rankings, and the specific recommendations otherwise. `quotes` is off by default. An unknown name stops the run before any download or model call.
+
+## Man page
+
+A man page lives in [`man/summarize_video.1`](man/summarize_video.1). Read it in place with `man ./man/summarize_video.1`, or install it:
+
+```bash
+mkdir -p ~/.local/share/man/man1
+cp man/summarize_video.1 ~/.local/share/man/man1/
+```
+
+Then `man summarize_video` works if `~/.local/share/man` is on your `MANPATH`.
 
 ## Using other models
 
@@ -105,11 +129,11 @@ Each run creates one folder, e.g. `~/Documents/video-summaries/2020-09-08_react-
 
 | File                  | Contents                                                                                                                   |
 | --------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `summary.md`          | The model's summary (TL;DR, key points, section walkthrough, takeaways, notable quotes) with `[HH:MM:SS]` markers.         |
+| `summary.md`          | The model's summary (TL;DR, actionable summary, key points, section walkthrough) with `[HH:MM:SS]` markers.         |
 | `transcript.md`       | Formatted transcript: chapters as headings (when the video has them), paragraphs prefixed with their `[HH:MM:SS]` start time. |
 | `transcript.txt`      | Plain transcript with a timestamp marker every 30 seconds. This is the exact text sent to the model.                       |
 | `transcript.raw.vtt`  | The original subtitle file, kept as-is.                                                                                    |
-| `metadata.json`       | Video details, chapter count, and which provider and model summarized it.                                                  |
+| `metadata.json`       | Video details, chapter count, and which tool version, provider, model and sections summarized it.                                                  |
 
 ## Cost
 
@@ -119,6 +143,15 @@ A summary costs a few cents; a 1-hour talk is roughly 15k input tokens. The tool
 
 ```bash
 uv run --with pytest pytest -q test_summarize_video.py
+```
+
+### Releasing
+
+Bump `__version__` in `summarize_video.py` and the version on the first line of `man/summarize_video.1` (a test checks that they match). After the change merges, tag it and publish:
+
+```bash
+git tag vX.Y.Z && git push origin vX.Y.Z
+gh release create vX.Y.Z --generate-notes
 ```
 
 Lint and format config for [Ruff](https://docs.astral.sh/ruff/) lives in [`pyproject.toml`](pyproject.toml). The tool is a single-file uv script and is not packaged.

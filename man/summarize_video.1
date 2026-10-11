@@ -1,0 +1,261 @@
+.TH SUMMARIZE_VIDEO 1 "October 11, 2026" "video-summarizer 0.2.0" "User Commands"
+.SH NAME
+summarize_video \- fetch a video's captions and summarize them with an AI model
+.SH SYNOPSIS
+.B summarize_video.py
+.I URL
+.RB [ \-\-model
+.IR MODEL ]
+.RB [ \-\-out
+.IR DIR ]
+.RB [ \-\-sections
+.IR LIST ]
+.RB [ \-\-provider
+.IR auto | anthropic | openai ]
+.RB [ \-\-base\-url
+.IR URL ]
+.RB [ \-\-price\-in
+.I N
+.BR \-\-price\-out
+.IR N ]
+.RB [ \-\-cookies\-from\-browser
+.IR BROWSER ]
+.RB [ \-\-no\-summary ]
+.RB [ \-\-version ]
+.SH DESCRIPTION
+.B summarize_video.py
+reads the captions that already exist on a video, using
+.BR yt\-dlp (1),
+cleans them into timestamped text, sends them to a model, and saves
+everything in one folder per video.
+It does not transcribe audio, so a video with no captions fails with
+an error.
+.PP
+Many users give the script a shell alias, such as
+.BR vidsum ,
+and call it that way.
+.PP
+.I URL
+can be any address that
+.B yt\-dlp
+supports.
+YouTube is the tested path.
+.SH OPTIONS
+.TP
+.BI \-\-model " MODEL"
+Model to use.
+Default:
+.B claude\-sonnet\-5
+(or the value of
+.BR VIDEO_SUMMARY_MODEL ).
+Any other name is sent to an OpenAI-compatible endpoint.
+.TP
+.BI \-\-out " DIR"
+Directory that holds the per-video folders.
+Default:
+.B ~/Documents/video\-summaries
+(or the value of
+.BR VIDEO_SUMMARY_DIR ).
+.TP
+.BI \-\-sections " LIST"
+Comma-separated list of summary sections to request.
+Valid names are
+.BR tldr ,
+.BR actionable ,
+.BR key\-points ,
+.BR walkthrough ,
+and
+.BR quotes ;
+.B all
+selects every section.
+Sections always appear in that order, whatever order you type them in.
+An unknown name stops the program before any download or model call.
+Default:
+.B tldr,actionable,key\-points,walkthrough
+(or the value of
+.BR VIDEO_SUMMARY_SECTIONS ).
+See
+.B SECTIONS
+below.
+.TP
+.BI \-\-provider " auto" | anthropic | openai
+Which provider path to use.
+.B auto
+(the default) picks Anthropic for
+.B claude\-*
+model names and the OpenAI-compatible path for everything else.
+Setting
+.B \-\-base\-url
+or
+.B OPENAI_BASE_URL
+forces the OpenAI-compatible path.
+.TP
+.BI \-\-base\-url " URL"
+An OpenAI-compatible endpoint, for example
+.B https://openrouter.ai/api/v1
+or
+.B http://localhost:11434/v1
+(Ollama).
+.TP
+.BI \-\-price\-in " N"
+.TQ
+.BI \-\-price\-out " N"
+Dollars per 1,000,000 input and output tokens.
+They set the cost estimate for models that are not in the built-in price table.
+Give both; one alone is ignored.
+.TP
+.BI \-\-cookies\-from\-browser " BROWSER"
+Send that browser's cookies to
+.BR yt\-dlp ,
+for example
+.BR chrome .
+Use this when YouTube answers with HTTP 429.
+.TP
+.B \-\-no\-summary
+Fetch and format the transcript only.
+No model call is made and no key is needed.
+.TP
+.B \-\-version
+Print the program version and exit.
+.SH SECTIONS
+.TP
+.B tldr
+Two or three sentences on the whole video.
+.TP
+.B actionable
+The part a viewer would act on, in the form that fits the video.
+A list video gets a numbered list of every item.
+A how-to gets prerequisites and numbered steps with the tools, settings and
+amounts mentioned.
+A ranking gets a list from best to worst with a reason for each.
+Other videos get their specific conclusions or recommendations.
+.TP
+.B key\-points
+The main points as bullets, in order.
+.TP
+.B walkthrough
+The video split into its natural segments, each with a timestamp, a heading
+and a short description.
+.TP
+.B quotes
+Up to five short verbatim quotes with timestamps.
+Off by default.
+.SH OUTPUT
+Each run creates a folder named
+.IB DATE _ title-slug
+inside the output directory, where
+.I DATE
+is the upload date.
+The folder holds:
+.TP
+.B summary.md
+The model's summary, with
+.RB [ HH:MM:SS ]
+markers.
+.TP
+.B transcript.md
+Formatted transcript: chapters as headings, and paragraphs prefixed with
+their start times.
+.TP
+.B transcript.txt
+Plain transcript with a marker every 30 seconds.
+This is the exact text sent to the model.
+.TP
+.B transcript.raw.vtt
+The original subtitle file.
+.TP
+.B metadata.json
+Video details, the tool version, the provider and model used, and the
+sections requested.
+.SH ENVIRONMENT
+.TP
+.B ANTHROPIC_API_KEY
+Key for the default Claude provider.
+.TP
+.B OPENAI_API_KEY
+Key for OpenAI-compatible endpoints.
+Local endpoints such as Ollama need none.
+.TP
+.B OPENAI_BASE_URL
+Same effect as
+.BR \-\-base\-url .
+.TP
+.B VIDEO_SUMMARY_MODEL
+Default for
+.BR \-\-model .
+.TP
+.B VIDEO_SUMMARY_DIR
+Default for
+.BR \-\-out .
+.TP
+.B VIDEO_SUMMARY_SECTIONS
+Default for
+.BR \-\-sections .
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+An error, such as a missing
+.BR yt\-dlp ,
+a video with no captions, a download failure, an invalid
+.B \-\-sections
+value, or a model that declined to summarize.
+.PP
+If no API key is set, the transcript files are still saved, a warning is
+printed, and the exit status is 0.
+.SH EXAMPLES
+Summarize a video with the default sections:
+.PP
+.RS
+.nf
+summarize_video.py "https://youtu.be/VIDEO_ID"
+.fi
+.RE
+.PP
+Only the list, steps or ranking:
+.PP
+.RS
+.nf
+summarize_video.py "https://youtu.be/VIDEO_ID" \-\-sections actionable
+.fi
+.RE
+.PP
+Add the quotes back:
+.PP
+.RS
+.nf
+summarize_video.py "https://youtu.be/VIDEO_ID" \-\-sections all
+.fi
+.RE
+.PP
+Make a section choice permanent:
+.PP
+.RS
+.nf
+export VIDEO_SUMMARY_SECTIONS=tldr,actionable
+.fi
+.RE
+.PP
+Retry after an HTTP 429 from YouTube:
+.PP
+.RS
+.nf
+summarize_video.py "https://youtu.be/VIDEO_ID" \-\-cookies\-from\-browser chrome
+.fi
+.RE
+.PP
+Use a local Ollama model:
+.PP
+.RS
+.nf
+summarize_video.py "https://youtu.be/VIDEO_ID" \-\-model llama3.1 \e
+  \-\-base\-url http://localhost:11434/v1
+.fi
+.RE
+.SH SEE ALSO
+.BR yt\-dlp (1),
+.BR uv (1)
+.SH AUTHORS
+Project home: https://github.com/jboho/video-summarizer
