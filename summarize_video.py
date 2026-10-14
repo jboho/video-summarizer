@@ -180,21 +180,12 @@ def parse_vtt(path: Path) -> list[tuple[float, str]]:
         lines = block.strip().splitlines()
         if not lines:
             continue
-        header = lines[0].strip()  # pragma: no mutate
-        if (
-            header.startswith("WEBVTT")  # pragma: no mutate
-            or header.startswith("NOTE")  # pragma: no mutate
-            or header == ""  # pragma: no mutate
-        ):  # pragma: no mutate
-            # Skip file header and NOTE metadata blocks, but a cue may still
-            # follow inside the same block if timing is on a later line.
-            timing_idx = next((i for i, ln in enumerate(lines) if "-->" in ln), None)
-            if timing_idx is None:
-                continue
-        else:
-            timing_idx = next((i for i, ln in enumerate(lines) if "-->" in ln), None)
-            if timing_idx is None:
-                continue
+        # A block without a timing line (the WEBVTT header, NOTE metadata,
+        # stray text) holds no cue. A cue may follow the header in the same
+        # block, so look for the timing line rather than checking line 0.
+        timing_idx = next((i for i, ln in enumerate(lines) if "-->" in ln), None)
+        if timing_idx is None:
+            continue
 
         start = _ts_to_seconds(lines[timing_idx].split("-->")[0])
         for text_line in lines[timing_idx + 1 :]:
