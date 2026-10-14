@@ -20,6 +20,7 @@ _ENV_VARS = (
     "OPENAI_BASE_URL",
     "VIDEO_SUMMARY_MODEL",
     "VIDEO_SUMMARY_SECTIONS",
+    "VIDEO_SUMMARY_COOKIES_BROWSER",
 )
 
 
@@ -371,7 +372,7 @@ def _main_output(capsys):
 
 def test_main_429_reports_rate_limit_not_no_captions(monkeypatch, tmp_path, capsys):
     err = "ERROR: Unable to download video subtitles: HTTP Error 429: Too Many Requests"
-    _run_main(monkeypatch, tmp_path, 1, err, False)
+    _run_main(monkeypatch, tmp_path, 1, err, False, ["--no-cookies"])
     text = _main_output(capsys)
     assert "429" in text and "--cookies-from-browser" in text
     assert "No captions found" not in text
@@ -387,7 +388,7 @@ def test_main_other_ytdlp_error_shows_its_text(monkeypatch, tmp_path, capsys):
 
 def test_main_429_inside_a_video_id_is_not_a_rate_limit(monkeypatch, tmp_path, capsys):
     err = "ERROR: [youtube] aB4296xyz12: Video unavailable"
-    _run_main(monkeypatch, tmp_path, 1, err, False)
+    _run_main(monkeypatch, tmp_path, 1, err, False, ["--no-cookies"])
     text = _main_output(capsys)
     assert "Video unavailable" in text
     assert "rate-limited" not in text and "--cookies-from-browser" not in text
@@ -410,6 +411,113 @@ def test_main_429_hint_skipped_when_cookies_already_passed(
     text = _main_output(capsys)
     assert "HTTP Error 429" in text
     assert "rate-limited" not in text
+
+
+def test_main_429_hint_skipped_with_default_cookies(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(sv, "DEFAULT_COOKIES_BROWSER", "chrome")
+    _run_main(
+        monkeypatch, tmp_path, 1, "ERROR: HTTP Error 429: Too Many Requests", False
+    )
+    text = _main_output(capsys)
+    assert "HTTP Error 429" in text
+    assert "rate-limited" not in text
+
+
+def _record_cmds(monkeypatch):
+    cmds = []
+    run = sv.subprocess.run
+
+    def recording_run(cmd, **kwargs):
+        cmds.append(cmd)
+        return run(cmd, **kwargs)
+
+    monkeypatch.setattr(sv.subprocess, "run", recording_run)
+    return cmds
+
+
+def test_main_sends_default_browser_cookies(monkeypatch, tmp_path):
+    monkeypatch.setattr(sv, "DEFAULT_COOKIES_BROWSER", "chrome")
+    _run_main(monkeypatch, tmp_path, 0, "", True)
+    cmds = _record_cmds(monkeypatch)
+    sv.main()
+    assert len(cmds) == 2
+    for cmd in cmds:
+        i = cmd.index("--cookies-from-browser")
+        assert cmd[i + 1] == "chrome"
+
+
+def test_main_no_cookies_sends_none(monkeypatch, tmp_path):
+    monkeypatch.setattr(sv, "DEFAULT_COOKIES_BROWSER", "chrome")
+    _run_main(monkeypatch, tmp_path, 0, "", True, ["--no-cookies"])
+    cmds = _record_cmds(monkeypatch)
+    sv.main()
+    assert len(cmds) == 2
+    assert all("--cookies-from-browser" not in cmd for cmd in cmds)
+
+
+def test_default_cookies_browser_is_chrome_unless_env_overrides(monkeypatch):
+    try:
+        importlib.reload(sv)
+        assert sv.DEFAULT_COOKIES_BROWSER == "chrome"
+        monkeypatch.setenv("VIDEO_SUMMARY_COOKIES_BROWSER", "firefox")
+        importlib.reload(sv)
+        assert sv.DEFAULT_COOKIES_BROWSER == "firefox"
+        monkeypatch.setenv("VIDEO_SUMMARY_COOKIES_BROWSER", "")
+        importlib.reload(sv)
+        assert sv.DEFAULT_COOKIES_BROWSER == ""
+    finally:
+        monkeypatch.delenv("VIDEO_SUMMARY_COOKIES_BROWSER", raising=False)
+        importlib.reload(sv)
+
+
+_NO_COOKIE_DB = (
+    'ERROR: could not find vivaldi cookies database in "/Users/x/Library/'
+    'Application Support/Vivaldi"'
+)
+_BOT_CHECK = (
+    "ERROR: [youtube] abc: Sign in to confirm you're not a bot. Use "
+    "--cookies-from-browser or --cookies for the authentication."
+)
+
+
+@pytest.mark.parametrize(
+    "err",
+    [
+        _NO_COOKIE_DB,
+        "ERROR: failed to load cookies",
+        'yt-dlp: error: unsupported browser specified for cookies: "vivaldy".',
+        "ERROR: unknown browser: vivaldy",
+        "ERROR: failed to read from keyring",
+    ],
+)
+def test_cookie_hint_on_cookie_read_failure(err):
+    hint = sv._cookie_hint(err, "vivaldi")
+    assert "vivaldi" in hint and "--no-cookies" in hint
+
+
+@pytest.mark.parametrize(
+    "err", [_BOT_CHECK, "ERROR: HTTP Error 429: Too Many Requests"]
+)
+def test_cookie_hint_ignores_other_errors(err):
+    assert sv._cookie_hint(err, "chrome") == ""
+
+
+def test_cookie_hint_needs_a_browser():
+    assert sv._cookie_hint(_NO_COOKIE_DB, None) == ""
+
+
+def test_main_cookie_read_failure_in_subs_shows_hint(monkeypatch, tmp_path, capsys):
+    _run_main(
+        monkeypatch,
+        tmp_path,
+        1,
+        _NO_COOKIE_DB,
+        False,
+        ["--cookies-from-browser", "vivaldi"],
+    )
+    text = _main_output(capsys)
+    assert "could not find vivaldi cookies database" in text
+    assert "Could not read vivaldi's cookies" in text and "--no-cookies" in text
 
 
 def test_main_clean_exit_no_subs_says_no_captions(monkeypatch, tmp_path, capsys):
@@ -1029,6 +1137,28 @@ def test_fetch_metadata_dies_with_ytdlp_stderr(monkeypatch, capsys):
     assert e.value.code == 1
     err = capsys.readouterr().err
     assert "could not read the video" in err and "Video unavailable" in err
+
+
+def test_fetch_metadata_cookie_read_failure_shows_hint(monkeypatch, capsys):
+    def fake_run(cmd, **kwargs):
+        raise subprocess.CalledProcessError(1, cmd, stderr=_NO_COOKIE_DB)
+
+    monkeypatch.setattr(sv.subprocess, "run", fake_run)
+    with pytest.raises(SystemExit):
+        sv.fetch_metadata("http://x", "vivaldi")
+    err = capsys.readouterr().err
+    assert "Could not read vivaldi's cookies" in err and "--no-cookies" in err
+
+
+def test_fetch_metadata_bot_check_gets_no_cookie_hint(monkeypatch, capsys):
+    def fake_run(cmd, **kwargs):
+        raise subprocess.CalledProcessError(1, cmd, stderr=_BOT_CHECK)
+
+    monkeypatch.setattr(sv.subprocess, "run", fake_run)
+    with pytest.raises(SystemExit):
+        sv.fetch_metadata("http://x", "chrome")
+    err = capsys.readouterr().err
+    assert "Sign in to confirm" in err and "Could not read" not in err
 
 
 def _fake_subs_run(monkeypatch, tmp_path, names, returncode=0, stderr=""):

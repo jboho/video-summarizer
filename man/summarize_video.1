@@ -19,7 +19,7 @@ summarize_video \- fetch a video's captions and summarize them with an AI model
 .BR \-\-price\-out
 .IR N ]
 .RB [ \-\-cookies\-from\-browser
-.IR BROWSER ]
+.IR BROWSER " | " \-\-no\-cookies ]
 .RB [ \-\-no\-summary ]
 .RB [ \-\-version ]
 .SH DESCRIPTION
@@ -106,10 +106,15 @@ Give both; one alone is ignored.
 .TP
 .BI \-\-cookies\-from\-browser " BROWSER"
 Send that browser's cookies to
-.BR yt\-dlp ,
-for example
-.BR chrome .
-Use this when YouTube answers with HTTP 429.
+.BR yt\-dlp .
+Default:
+.B chrome
+(or the value of
+.BR VIDEO_SUMMARY_COOKIES_BROWSER ).
+YouTube answers requests without cookies with HTTP 429.
+.TP
+.B \-\-no\-cookies
+Send no browser cookies.
 .TP
 .B \-\-no\-summary
 Fetch and format the transcript only.
@@ -191,6 +196,11 @@ Default for
 .B VIDEO_SUMMARY_SECTIONS
 Default for
 .BR \-\-sections .
+.TP
+.B VIDEO_SUMMARY_COOKIES_BROWSER
+Default for
+.BR \-\-cookies\-from\-browser .
+Set it empty to send no cookies.
 .SH EXIT STATUS
 .TP
 .B 0
@@ -238,11 +248,11 @@ export VIDEO_SUMMARY_SECTIONS=tldr,actionable
 .fi
 .RE
 .PP
-Retry after an HTTP 429 from YouTube:
+Use Firefox's cookies instead of Chrome's:
 .PP
 .RS
 .nf
-summarize_video.py "https://youtu.be/VIDEO_ID" \-\-cookies\-from\-browser chrome
+summarize_video.py "https://youtu.be/VIDEO_ID" \-\-cookies\-from\-browser firefox
 .fi
 .RE
 .PP
