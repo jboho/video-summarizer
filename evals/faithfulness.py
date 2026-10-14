@@ -15,12 +15,20 @@ Two layers:
     selfcheck   free: runs the deterministic layer and the scorer on the gold
                 cases to prove the ruler works before any paid call
 
-Gold cases live outside this public repo, next to the transcripts:
+The system eval measures the summarizer itself on a fixed set of videos:
+    regen          summarize each video again with the production prompt (paid)
+    system-eval    run the checks and the judge on those summaries (paid)
+    system-report  error rates per split, and a labels file for the judge's flags
+
+Gold cases and video sets live outside this public repo, next to the transcripts:
     $VIDEO_SUMMARY_DIR/_eval/cases/<video-folder>.json
+    $VIDEO_SUMMARY_DIR/_eval/sets/<name>.json
 """
 
 import argparse
+import hashlib
 import html
+import inspect
 import json
 import math
 import os
@@ -577,50 +585,58 @@ def cmd_judge_eval(args) -> int:
             },
         }
 
-    def run_batch(batch: list[tuple[Variant, str, int]]) -> None:
-        with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            futures = {pool.submit(one, v, t, rep): (v, rep) for v, t, rep in batch}
+    run_parallel(
+        jobs,
+        one,
+        ident=lambda v, t, rep: {"prompt_id": v.case_id, "rep": rep},
+        show=lambda row: (
+            f"detected={row['grade']['detected']} "
+            f"issues={row['grade']['issues']} {row['latency_s']}s"
+        ),
+        warm_key=lambda v, t, rep: v.case_id.split("/")[0],
+        results_path=results_path,
+        workers=args.workers,
+    )
+    return report(results_path)
+
+
+def run_parallel(jobs, one, ident, show, warm_key, results_path, workers) -> None:
+    """Run one(*job) for every job in a thread pool. Rows go to results.jsonl;
+    failures go to errors.jsonl, recorded and never scored as a miss.
+
+    With warm_key, the first job per key runs before the rest, so the parallel
+    calls read that transcript's prompt cache instead of each paying to write it.
+    """
+    errors_path = results_path.with_name("errors.jsonl")
+
+    def batch(part: list) -> None:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(one, *job): job for job in part}
             for fut in as_completed(futures):
-                v, rep = futures[fut]
+                who = ident(*futures[fut])
+                label = " ".join(str(v) for v in who.values())
                 try:
                     row = fut.result()
-                except Exception as exc:  # recorded, never scored as a miss
-                    with (run_dir / "errors.jsonl").open("a") as f:
-                        f.write(
-                            json.dumps(
-                                {
-                                    "prompt_id": v.case_id,
-                                    "rep": rep,
-                                    "class": type(exc).__name__,
-                                    "error": str(exc)[:500],
-                                }
-                            )
-                            + "\n"
-                        )
-                    print(
-                        f"ERROR {v.case_id} rep{rep}: {type(exc).__name__}: {exc}",
-                        flush=True,
-                    )
+                # SystemExit too: the summarizer's die() exits on a refusal.
+                except (Exception, SystemExit) as exc:
+                    err = {"class": type(exc).__name__, "error": str(exc)[:500]}
+                    with errors_path.open("a") as f:
+                        f.write(json.dumps(who | err) + "\n")
+                    print(f"ERROR {label}: {err['class']}: {exc}", flush=True)
                     continue
                 with results_path.open("a") as f:
                     f.write(json.dumps(row) + "\n")
-                print(
-                    f"{v.case_id:24} rep{rep} detected={row['grade']['detected']} "
-                    f"issues={row['grade']['issues']} {row['latency_s']}s",
-                    flush=True,
-                )
+                print(f"{label:30} {show(row)}", flush=True)
 
-    # One call per transcript first, so the parallel calls read its cache
-    # instead of each paying to write it.
     warm, seen = [], set()
-    for job in jobs:
-        prefix = job[0].case_id.split("/")[0]
-        if prefix not in seen:
-            seen.add(prefix)
-            warm.append(job)
-    run_batch(warm)
-    run_batch([j for j in jobs if j not in warm])
-    return report(results_path)
+    if warm_key:
+        for job in jobs:
+            key = warm_key(*job)
+            if key not in seen:
+                seen.add(key)
+                warm.append(job)
+    batch(warm)
+    batch([j for j in jobs if j not in warm])
 
 
 def report(results_path: Path) -> int:
@@ -692,6 +708,386 @@ def report_flag_labels(rows: list[dict]) -> None:
         print(f"  needs a label ({pid}): {quote[:90]}")
 
 
+# ---------------------------------------------------------------- system eval
+#
+# A set file is a list of {"video": folder, "type": ..., "split": "dev" |
+# "held-out"}. Edit the prompt against dev only; score held-out once at the end.
+
+GEN_FIELDS = ("prompt_sha", "model", "sections")
+
+
+def load_set(name: str, split: str) -> list[dict]:
+    rows = json.loads((EVAL_DIR / "sets" / f"{name}.json").read_text())
+    if split != "all":
+        rows = [r for r in rows if r["split"] == split]
+    if not rows:
+        sys.exit(f"set {name!r} has no videos in split {split!r}")
+    return rows
+
+
+def prompt_meta(saved: dict) -> dict:
+    """Turn a saved metadata.json back into the yt-dlp keys build_user_content
+    reads. The saved "duration" is "HH:MM:SS" text; the prompt wants seconds."""
+    return {
+        "title": saved["title"],
+        "uploader": saved["channel"],
+        "duration": saved["duration_seconds"],
+        "webpage_url": saved["webpage_url"],
+    }
+
+
+def prompt_sha(sections: list[str]) -> str:
+    """Fingerprint of everything the summarizer sends, minus the video itself:
+    system prompt, user-message template, and the call's settings."""
+    dummy = {"title": "T", "uploader": "C", "duration": 1, "webpage_url": "U"}
+    text = "\n".join(
+        [
+            sv.SUMMARY_SYSTEM,
+            sv.build_user_content(dummy, "", sections),
+            inspect.getsource(sv.summarize_anthropic),
+        ]
+    )
+    return hashlib.sha256(text.encode()).hexdigest()[:12]
+
+
+def check_stamp(path: Path, stamp: dict) -> None:
+    """A variant name stands for one prompt. Refuse to add summaries made with a
+    different prompt, model or sections under the same name."""
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(stamp, indent=1))
+        return
+    old = json.loads(path.read_text())
+    changed = [k for k in GEN_FIELDS if old.get(k) != stamp[k]]
+    if changed:
+        sys.exit(
+            f"{path.parent.name} was made with a different {', '.join(changed)}; "
+            "pick a new --variant name"
+        )
+
+
+def gen_dir(variant: str) -> Path:
+    return EVAL_DIR / "runs" / "gen" / variant
+
+
+def system_dir(variant: str) -> Path:
+    return EVAL_DIR / "runs" / "system" / variant
+
+
+def gen_cost(model: str, usage: tuple[int, int] | None) -> float | None:
+    price = sv.PRICES.get(model)
+    if usage is None or price is None:
+        return None
+    return (usage[0] * price[0] + usage[1] * price[1]) / 1_000_000
+
+
+def cmd_regen(args) -> int:
+    videos = load_set(args.set, args.split)
+    sections = sv.parse_sections(args.sections)
+    out = gen_dir(args.variant)
+    jobs = [
+        (r, rep)
+        for r in videos
+        for rep in range(args.reps)
+        if not (out / r["video"] / f"rep{rep}" / "summary.md").exists()
+    ]
+    stamp = {
+        "prompt_sha": prompt_sha(sections),
+        "model": args.model,
+        "sections": sections,
+    }
+    if args.dry_run:
+        chars = sum(
+            (CORPUS / r["video"] / "transcript.txt").stat().st_size for r, _ in jobs
+        )
+        print(
+            f"{len(jobs)} summaries to write on {args.model}, "
+            f"prompt {stamp['prompt_sha']}"
+        )
+        print(f"~{chars // 4:,} transcript tokens (chars/4, rough)")
+        for r, rep in jobs:
+            print(f"  {r['split']:8} {r['type']:19} rep{rep} {r['video']}")
+        return 0
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        sys.exit("ANTHROPIC_API_KEY is not set")
+    check_stamp(out / "variant.json", stamp)
+    print(f"{len(jobs)} summaries to write -> {out}", flush=True)
+
+    def one(r: dict, rep: int) -> dict:
+        vdir = CORPUS / r["video"]
+        saved = json.loads((vdir / "metadata.json").read_text())
+        transcript = (vdir / "transcript.txt").read_text()
+        start = time.monotonic()
+        text, usage = sv.summarize_anthropic(
+            args.model, prompt_meta(saved), transcript, sections
+        )
+        tokens = sv.normalize_usage("anthropic", usage)
+        row = {
+            "video": r["video"],
+            "rep": rep,
+            "model": args.model,
+            "prompt_sha": stamp["prompt_sha"],
+            "usage": {"input_tokens": tokens[0], "output_tokens": tokens[1]},
+            "cost": gen_cost(args.model, tokens),
+            "latency_s": round(time.monotonic() - start, 1),
+        }
+        rdir = out / r["video"] / f"rep{rep}"
+        rdir.mkdir(parents=True, exist_ok=True)
+        # Same file the tool writes, so line numbers match a real summary.md.
+        # Written last: a summary.md on disk means the job finished.
+        (rdir / "summary.md").write_text(
+            f"# {saved['title']}\n\n"
+            f"[Watch]({saved['webpage_url']}) · "
+            f"{saved['channel']} · {saved['duration']}\n\n"
+            f"{text}\n"
+        )
+        return row
+
+    run_parallel(
+        jobs,
+        one,
+        ident=lambda r, rep: {"video": r["video"], "rep": rep},
+        show=lambda row: (
+            f"out={row['usage']['output_tokens']} "
+            f"${row['cost'] or 0:.3f} {row['latency_s']}s"
+        ),
+        warm_key=None,
+        results_path=out / "results.jsonl",
+        workers=args.workers,
+    )
+    return 0
+
+
+def generated(variant: str, videos: list[dict]) -> list[tuple[dict, int, Path]]:
+    out = []
+    for r in videos:
+        for rdir in sorted((gen_dir(variant) / r["video"]).glob("rep*")):
+            if (rdir / "summary.md").exists():
+                out.append((r, int(rdir.name.removeprefix("rep")), rdir))
+    return out
+
+
+def cmd_system_eval(args) -> int:
+    videos = load_set(args.set, args.split)
+    items = generated(args.variant, videos)
+    if not items:
+        sys.exit(f"no summaries under {gen_dir(args.variant)}; run regen first")
+    stamp = json.loads((gen_dir(args.variant) / "variant.json").read_text())
+    run_dir = system_dir(args.variant)
+    results_path = run_dir / "results.jsonl"
+    done = set()
+    if results_path.exists():
+        for line in results_path.read_text().splitlines():
+            row = json.loads(line)
+            done.add((row["video"], row["rep"]))
+    jobs = [j for j in items if (j[0]["video"], j[1]) not in done]
+    if args.dry_run:
+        chars = sum(
+            (CORPUS / r["video"] / "transcript.txt").stat().st_size
+            + (rdir / "summary.md").stat().st_size
+            for r, _, rdir in jobs
+        )
+        print(f"{len(jobs)} judge calls on {args.model} ({len(done)} already done)")
+        print(f"~{chars // 4:,} input tokens before caching (chars/4, rough)")
+        return 0
+
+    import anthropic
+
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        sys.exit("ANTHROPIC_API_KEY is not set")
+    client = anthropic.Anthropic(max_retries=4)
+    (run_dir / "traces").mkdir(parents=True, exist_ok=True)
+    print(
+        f"{len(jobs)} judge calls ({len(done)} already done) -> {run_dir}", flush=True
+    )
+
+    def one(r: dict, rep: int, rdir: Path) -> dict:
+        vdir = CORPUS / r["video"]
+        summary = (rdir / "summary.md").read_text()
+        transcript = (vdir / "transcript.txt").read_text()
+        saved = json.loads((vdir / "metadata.json").read_text())
+        findings = run_checks(
+            summary, transcript, saved["duration_seconds"], stamp["sections"]
+        )
+        response, latency = call_judge(
+            client, args.model, transcript, summary, args.effort, args.timeout_s
+        )
+        parsed = json.loads(next(b.text for b in response.content if b.type == "text"))
+        trace = [
+            {"role": "system", "content": JUDGE_SYSTEM},
+            {
+                "role": "user",
+                "content": f"<summary>\n{summary}\n</summary>\n\n{JUDGE_INSTRUCTIONS}",
+            },
+            {"role": "assistant", "content": json.dumps(parsed, indent=2)},
+        ]
+        (run_dir / "traces" / f"{r['video']}_rep{rep}.json").write_text(
+            json.dumps(trace, indent=1)
+        )
+        return {
+            "video": r["video"],
+            "type": r["type"],
+            "split": r["split"],
+            "rep": rep,
+            "status": "truncated" if response.stop_reason == "max_tokens" else "ok",
+            "stop_reason": response.stop_reason,
+            "model": response.model,
+            "usage": usage_dict(response.usage),
+            "latency_s": round(latency, 1),
+            "checks": {
+                "errors": [f.detail for f in findings if not f.advisory],
+                "advisory": sum(f.advisory for f in findings),
+            },
+            "claims_checked": parsed["claims_checked"],
+            "issues": parsed["issues"],
+        }
+
+    run_parallel(
+        jobs,
+        one,
+        ident=lambda r, rep, rdir: {"video": r["video"], "rep": rep},
+        show=lambda row: (
+            (
+                f"issues={len(row['issues'])} claims={row['claims_checked']} "
+                if row["split"] == "dev"
+                else "held-out "
+            )
+            + f"{row['latency_s']}s"
+        ),
+        warm_key=lambda r, rep, rdir: r["video"],
+        results_path=results_path,
+        workers=args.workers,
+    )
+    print("\nDev split only; held-out stays unread until the final comparison.")
+    return cmd_system_report(argparse.Namespace(variant=args.variant, split="dev"))
+
+
+def flag_id(row: dict, n: int) -> str:
+    return f"{row['video']}/rep{row['rep']}/{n}"
+
+
+def sync_labels(path: Path, rows: list[dict], variant: str) -> list[dict]:
+    """Write one entry per judge flag, keeping any verdicts already filled in.
+
+    A flag's id is video/rep/position. Rows are append-only and never re-judged,
+    so the position of a flag in its row never changes.
+    """
+    old = {e["id"]: e for e in json.loads(path.read_text())} if path.exists() else {}
+    entries = []
+    for row in rows:
+        for n, issue in enumerate(row["issues"], 1):
+            fid = flag_id(row, n)
+            entries.append(
+                {
+                    "id": fid,
+                    "verdict": old.get(fid, {}).get("verdict"),
+                    "category": issue["category"],
+                    "severity": issue["severity"],
+                    "summary_quote": issue["summary_quote"],
+                    "transcript_ts": issue["transcript_ts"],
+                    "transcript_quote": issue["transcript_quote"],
+                    "judge_says": issue["explanation"],
+                    "summary_file": f"runs/gen/{variant}/{row['video']}/"
+                    f"rep{row['rep']}/summary.md",
+                }
+                | ({"note": old[fid]["note"]} if old.get(fid, {}).get("note") else {})
+            )
+    path.write_text(json.dumps(entries, indent=1, ensure_ascii=False) + "\n")
+    return entries
+
+
+def mean_sd(xs: list[float]) -> tuple[float, float]:
+    m = sum(xs) / len(xs)
+    sd = (
+        math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1)) if len(xs) > 1 else 0.0
+    )
+    return m, sd
+
+
+def cmd_system_report(args) -> int:
+    run_dir = system_dir(args.variant)
+    rows = [
+        json.loads(ln) for ln in (run_dir / "results.jsonl").read_text().splitlines()
+    ]
+    ok = [r for r in rows if r["status"] == "ok"]
+    part = ok if args.split == "all" else [r for r in ok if r["split"] == args.split]
+    if not part:
+        sys.exit(f"no judged summaries in split {args.split!r}")
+    n = len(part)
+    flags = [len(r["issues"]) for r in part]
+    claims = sum(r["claims_checked"] for r in part)
+    m, sd = mean_sd(flags)
+    print(
+        f"{args.variant} / {args.split}: {n} summaries, "
+        f"{len({r['video'] for r in part})} videos"
+    )
+    print(
+        f"  judge flags per summary: mean {m:.2f} (sd {sd:.2f}); "
+        f"{100 * sum(flags) / max(claims, 1):.1f} per 100 claims ({claims} claims)"
+    )
+    clean = sum(not any(i["severity"] == "major" for i in r["issues"]) for r in part)
+    lo, hi = wilson(clean, n)
+    print(
+        f"  summaries with no major flag: {clean}/{n} (95% CI {lo:.2f}-{hi:.2f}; "
+        "two reps of one video are not independent)"
+    )
+    cats: dict[str, int] = {}
+    for r in part:
+        for i in r["issues"]:
+            key = f"{i['category']}/{i['severity']}"
+            cats[key] = cats.get(key, 0) + 1
+    by_cat = ", ".join(f"{k} {v}" for k, v in sorted(cats.items()))
+    print(f"  by category: {by_cat or 'none'}")
+    for kind in sorted({r["type"] for r in part}):
+        xs = [len(r["issues"]) for r in part if r["type"] == kind]
+        print(f"  {kind:19} {len(xs):>2} summaries, mean flags {sum(xs) / len(xs):.2f}")
+    by_video: dict[str, dict[int, int]] = {}
+    for r in part:
+        by_video.setdefault(r["video"], {})[r["rep"]] = len(r["issues"])
+    pairs = [(v[0], v[1]) for v in by_video.values() if 0 in v and 1 in v]
+    if pairs:
+        gap = sum(abs(a - b) for a, b in pairs) / len(pairs)
+        print(
+            f"  rep0 vs rep1, mean |flag difference| per video: {gap:.2f} "
+            f"({len(pairs)} videos)"
+        )
+    hard = sum(len(r["checks"]["errors"]) for r in part)
+    adv = sum(r["checks"]["advisory"] for r in part)
+    print(f"  deterministic checks: {hard} errors, {adv} advisory")
+    for r in part:
+        for e in r["checks"]["errors"]:
+            print(f"    {r['video'][:10]} rep{r['rep']}: {e}")
+
+    labels_path = run_dir / f"labels-{args.split}.json"
+    entries = sync_labels(labels_path, part, args.variant)
+    real = sum(e["verdict"] == "real" for e in entries)
+    false = sum(e["verdict"] == "false_alarm" for e in entries)
+    print(
+        f"  flags labeled: {real + false}/{len(entries)} "
+        f"(real {real}, false alarm {false}) -> {labels_path}"
+    )
+    if real + false:
+        lo, hi = wilson(real, real + false)
+        print(
+            f"  judge precision on labeled flags: {real}/{real + false} "
+            f"(95% CI {lo:.2f}-{hi:.2f})"
+        )
+
+    gen_rows_path = gen_dir(args.variant) / "results.jsonl"
+    gen_spend = 0.0
+    if gen_rows_path.exists():
+        gen_spend = sum(
+            json.loads(ln).get("cost") or 0
+            for ln in gen_rows_path.read_text().splitlines()
+        )
+    judge_spend = sum(cost(price_key(r["model"]), r["usage"]) for r in rows)
+    print(
+        f"rows {len(rows)} (ok {len(ok)}); measured spend: "
+        f"generation ${gen_spend:.2f}, judge ${judge_spend:.2f} (all splits)"
+    )
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -724,6 +1120,43 @@ def main() -> int:
     r.set_defaults(
         func=lambda a: report(EVAL_DIR / "runs" / "judge" / a.variant / "results.jsonl")
     )
+
+    def set_args(p, split_default: str) -> None:
+        p.add_argument("--set", default="phase2", help="name under _eval/sets/")
+        p.add_argument(
+            "--split", default=split_default, choices=["dev", "held-out", "all"]
+        )
+        p.add_argument("--variant", default="baseline", help="name for this prompt")
+
+    g = sub.add_parser(
+        "regen", help="summarize a set with the production prompt (paid)"
+    )
+    set_args(g, "all")
+    g.add_argument("--model", default=sv.DEFAULT_MODEL)
+    g.add_argument("--sections", default=sv.DEFAULT_SECTIONS)
+    g.add_argument("--reps", type=int, default=1)
+    g.add_argument("--workers", type=int, default=4)
+    g.add_argument("--dry-run", action="store_true")
+    g.set_defaults(func=cmd_regen)
+
+    e = sub.add_parser(
+        "system-eval", help="checks + judge on regenerated summaries (paid)"
+    )
+    set_args(e, "all")
+    e.add_argument("--model", default=JUDGE_MODEL)
+    e.add_argument(
+        "--effort", default="medium", choices=["low", "medium", "high", "xhigh", "max"]
+    )
+    e.add_argument("--workers", type=int, default=4)
+    e.add_argument("--timeout-s", type=float, default=600)
+    e.add_argument("--dry-run", action="store_true")
+    e.set_defaults(func=cmd_system_eval)
+
+    sr = sub.add_parser(
+        "system-report", help="report a system run; write its labels file (free)"
+    )
+    set_args(sr, "dev")
+    sr.set_defaults(func=cmd_system_report)
 
     args = ap.parse_args()
     return args.func(args)

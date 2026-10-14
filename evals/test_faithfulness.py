@@ -152,3 +152,99 @@ def test_price_key_accepts_snapshots_and_rejects_unknown():
     assert f.price_key("claude-opus-5-5-20260901") == "claude-opus-5-5"
     with pytest.raises(KeyError):
         f.price_key("some-other-model")
+
+
+SAVED_META = {
+    "title": "A video",
+    "channel": "A channel",
+    "duration_seconds": 2697,
+    "duration": "00:44:57",
+    "webpage_url": "https://example.com/v",
+}
+
+
+def test_prompt_meta_feeds_the_production_header():
+    content = f.sv.build_user_content(f.prompt_meta(SAVED_META), "T", SECTIONS)
+    assert "Channel: A channel\nDuration: 00:44:57\n" in content
+
+
+def test_prompt_sha_tracks_the_sections():
+    assert f.prompt_sha(SECTIONS) == f.prompt_sha(list(SECTIONS))
+    assert f.prompt_sha(SECTIONS) != f.prompt_sha(["tldr"])
+
+
+def test_check_stamp_refuses_a_changed_prompt(tmp_path):
+    path = tmp_path / "v" / "variant.json"
+    stamp = {"prompt_sha": "abc", "model": "m", "sections": SECTIONS}
+    f.check_stamp(path, stamp)
+    f.check_stamp(path, dict(stamp))
+    with pytest.raises(SystemExit, match="prompt_sha"):
+        f.check_stamp(path, stamp | {"prompt_sha": "def"})
+
+
+def test_load_set_filters_by_split(tmp_path, monkeypatch):
+    monkeypatch.setattr(f, "EVAL_DIR", tmp_path)
+    (tmp_path / "sets").mkdir()
+    rows = [{"video": "a", "split": "dev"}, {"video": "b", "split": "held-out"}]
+    (tmp_path / "sets" / "s.json").write_text(f.json.dumps(rows))
+    assert [r["video"] for r in f.load_set("s", "dev")] == ["a"]
+    assert len(f.load_set("s", "all")) == 2
+    (tmp_path / "sets" / "e.json").write_text(f.json.dumps(rows[:1]))
+    with pytest.raises(SystemExit):
+        f.load_set("e", "held-out")
+
+
+def test_sync_labels_keeps_verdicts_and_adds_new_flags(tmp_path):
+    issue = {
+        "summary_quote": "q",
+        "category": "unsupported",
+        "severity": "minor",
+        "transcript_ts": "00:00:02",
+        "transcript_quote": "t",
+        "explanation": "e",
+    }
+    path = tmp_path / "labels-dev.json"
+    row = {"video": "2026-01-01_x", "rep": 0, "issues": [issue]}
+    first = f.sync_labels(path, [row], "base")
+    assert [e["id"] for e in first] == ["2026-01-01_x/rep0/1"]
+    labeled = f.json.loads(path.read_text())
+    labeled[0] |= {"verdict": "real", "note": "checked"}
+    path.write_text(f.json.dumps(labeled))
+    row2 = {"video": "2026-01-01_x", "rep": 1, "issues": [issue]}
+    again = f.sync_labels(path, [row, row2], "base")
+    assert [(e["id"], e["verdict"]) for e in again] == [
+        ("2026-01-01_x/rep0/1", "real"),
+        ("2026-01-01_x/rep1/1", None),
+    ]
+    assert again[0]["note"] == "checked"
+    assert again[1]["summary_file"] == "runs/gen/base/2026-01-01_x/rep1/summary.md"
+
+
+def test_run_parallel_records_rows_and_failures(tmp_path):
+    def one(name: str) -> dict:
+        if name == "boom":
+            raise RuntimeError("bad")
+        if name == "refused":
+            raise SystemExit(1)
+        return {"name": name}
+
+    results = tmp_path / "results.jsonl"
+    order: list[str] = []
+    f.run_parallel(
+        [("a",), ("boom",), ("refused",)],
+        lambda n: order.append(n) or one(n),
+        ident=lambda n: {"job": n},
+        show=lambda row: "",
+        warm_key=lambda n: "same",
+        results_path=results,
+        workers=2,
+    )
+    assert order[0] == "a"  # the warm job runs alone first
+    assert [f.json.loads(x)["name"] for x in results.read_text().splitlines()] == ["a"]
+    errors = [
+        f.json.loads(x) for x in (tmp_path / "errors.jsonl").read_text().splitlines()
+    ]
+    assert sorted((e["job"], e["class"]) for e in errors) == [
+        ("boom", "RuntimeError"),
+        ("refused", "SystemExit"),
+    ]
