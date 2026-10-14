@@ -75,9 +75,10 @@ Then: `vidsum "https://youtu.be/..."`
 | `--sections LIST`                  | Comma-separated summary sections: `tldr`, `actionable`, `key-points`, `walkthrough`, `quotes`, or `all`. Default `tldr,actionable,key-points,walkthrough`. Sections always come out in that order. |
 | `--no-summary`                     | Fetch and format the transcript only; skip the model call (no cost).                                                                        |
 | `--version`                        | Print the version and exit.                                                                                                                 |
-| `--cookies-from-browser BROWSER`   | Send that browser's cookies to yt-dlp (e.g. `chrome`). Use when YouTube answers with HTTP 429 and the tool wrongly reports "No captions found". |
+| `--cookies-from-browser BROWSER`   | Send that browser's cookies to yt-dlp. Default `chrome`, because YouTube answers requests without cookies with HTTP 429. The browser must be installed and signed in to YouTube. |
+| `--no-cookies`                     | Send no browser cookies.                                                                                                                    |
 
-Environment overrides: `VIDEO_SUMMARY_MODEL`, `VIDEO_SUMMARY_DIR`, `VIDEO_SUMMARY_SECTIONS`.
+Environment overrides: `VIDEO_SUMMARY_MODEL`, `VIDEO_SUMMARY_DIR`, `VIDEO_SUMMARY_SECTIONS`, `VIDEO_SUMMARY_COOKIES_BROWSER` (set it empty to send no cookies).
 
 ### Choosing sections
 

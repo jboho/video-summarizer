@@ -43,6 +43,11 @@ DEFAULT_OUT = os.environ.get(
     "VIDEO_SUMMARY_DIR", str(Path.home() / "Documents" / "video-summaries")
 )
 
+# YouTube rate-limits (HTTP 429) caption requests that carry no browser cookies,
+# so Chrome's cookies go along by default. An empty env value or --no-cookies
+# turns this off.
+DEFAULT_COOKIES_BROWSER = os.environ.get("VIDEO_SUMMARY_COOKIES_BROWSER", "chrome")
+
 # Emit a timestamp marker in the formatted transcript at least this often.
 TIMESTAMP_EVERY_SECONDS = 30
 
@@ -74,6 +79,26 @@ def _cookie_args(browser: str | None) -> list[str]:
     return ["--cookies-from-browser", browser] if browser else []
 
 
+# yt-dlp's errors for a browser whose cookies it can't read (yt_dlp/cookies.py,
+# yt_dlp/__init__.py). A bare "cookie" match would also catch YouTube's "Sign in
+# to confirm you're not a bot" message, which suggests --cookies-from-browser.
+_COOKIE_READ_RE = re.compile(
+    r"could not find \w+ cookies database|failed to load cookies"
+    r"|unsupported browser|unknown browser|failed to read from keyring",
+    re.IGNORECASE,
+)
+
+
+def _cookie_hint(err: str, browser: str | None) -> str:
+    """Point at the opt-outs when yt-dlp fails to read the browser's cookies."""
+    if browser and _COOKIE_READ_RE.search(err):
+        return (
+            f"\nCould not read {browser}'s cookies. Pass --cookies-from-browser "
+            "with another browser, or --no-cookies to send none."
+        )
+    return ""
+
+
 def fetch_metadata(url: str, cookies_browser: str | None = None) -> dict:
     """Get video metadata as a dict via yt-dlp -J (no download)."""
     try:
@@ -91,7 +116,9 @@ def fetch_metadata(url: str, cookies_browser: str | None = None) -> dict:
             check=True,
         ).stdout
     except subprocess.CalledProcessError as e:
-        die(f"yt-dlp could not read the video:\n{e.stderr.strip()}")
+        err = e.stderr.strip()
+        hint = _cookie_hint(err, cookies_browser)
+        die(f"yt-dlp could not read the video:\n{err}{hint}")
     return json.loads(out)
 
 
@@ -134,7 +161,7 @@ def download_subs(
         if proc.returncode != 0:
             # A failed download is not the same as a video without captions.
             err = (proc.stderr or "").strip() or f"yt-dlp exited with {proc.returncode}"
-            hint = ""
+            hint = _cookie_hint(err, cookies_browser)
             # Match yt-dlp's wording, not a bare "429": video IDs can contain it.
             if _RATE_LIMIT_RE.search(err) and not cookies_browser:
                 hint = (
@@ -593,8 +620,16 @@ def main() -> None:
     ap.add_argument(
         "--cookies-from-browser",
         metavar="BROWSER",
-        help="Send this browser's cookies to yt-dlp (e.g. chrome). "
-        "Use when YouTube returns HTTP 429.",
+        default=DEFAULT_COOKIES_BROWSER,
+        help="Send this browser's cookies to yt-dlp; YouTube rate-limits "
+        f"requests without them. default: {DEFAULT_COOKIES_BROWSER or 'none'}",
+    )
+    ap.add_argument(
+        "--no-cookies",
+        dest="cookies_from_browser",
+        action="store_const",
+        const=None,
+        help="Send no browser cookies to yt-dlp.",
     )
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = ap.parse_args()
