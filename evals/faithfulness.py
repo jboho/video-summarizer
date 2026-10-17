@@ -16,9 +16,12 @@ Two layers:
                 cases to prove the ruler works before any paid call
 
 The system eval measures the summarizer itself on a fixed set of videos:
-    regen          summarize each video again with the production prompt (paid)
-    system-eval    run the checks and the judge on those summaries (paid)
+    regen          summarize each video again with a prompt from prompts.py (paid)
+    system-eval    run the checks and the judge on those summaries (paid); the
+                   held-out split is scored once per variant
     system-report  error rates per split, and a labels file for the judge's flags
+
+The prompt-edit loop is described step by step in evals/README.md.
 
 Gold cases and video sets live outside this public repo, next to the transcripts:
     $VIDEO_SUMMARY_DIR/_eval/cases/<video-folder>.json
@@ -41,6 +44,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import prompts  # noqa: E402
+
 import summarize_video as sv  # noqa: E402
 
 CORPUS = Path(
@@ -714,6 +719,7 @@ def report_flag_labels(rows: list[dict]) -> None:
 # "held-out"}. Edit the prompt against dev only; score held-out once at the end.
 
 GEN_FIELDS = ("prompt_sha", "model", "sections")
+HELD_OUT_MARKER = "held-out-runs.json"
 
 
 def load_set(name: str, split: str) -> list[dict]:
@@ -782,6 +788,7 @@ def gen_cost(model: str, usage: tuple[int, int] | None) -> float | None:
 
 
 def cmd_regen(args) -> int:
+    prompts.apply_prompt(args.prompt)
     videos = load_set(args.set, args.split)
     sections = sv.parse_sections(args.sections)
     out = gen_dir(args.variant)
@@ -802,7 +809,7 @@ def cmd_regen(args) -> int:
         )
         print(
             f"{len(jobs)} summaries to write on {args.model}, "
-            f"prompt {stamp['prompt_sha']}"
+            f"prompt {args.prompt} ({stamp['prompt_sha']}) -> {out}"
         )
         print(f"~{chars // 4:,} transcript tokens (chars/4, rough)")
         for r, rep in jobs:
@@ -881,6 +888,8 @@ def cmd_system_eval(args) -> int:
             row = json.loads(line)
             done.add((row["video"], row["rep"]))
     jobs = [j for j in items if (j[0]["video"], j[1]) not in done]
+    if any(r["split"] == "held-out" for r, _, _ in items):
+        guard_held_out(run_dir, args)
     if args.dry_run:
         chars = sum(
             (CORPUS / r["video"] / "transcript.txt").stat().st_size
@@ -897,6 +906,10 @@ def cmd_system_eval(args) -> int:
         sys.exit("ANTHROPIC_API_KEY is not set")
     client = anthropic.Anthropic(max_retries=4)
     (run_dir / "traces").mkdir(parents=True, exist_ok=True)
+    if any(r["split"] == "held-out" for r, _, _ in jobs):
+        record_held_out(
+            run_dir, args, sum(r["split"] == "held-out" for r, _, _ in jobs)
+        )
     print(
         f"{len(jobs)} judge calls ({len(done)} already done) -> {run_dir}", flush=True
     )
@@ -960,6 +973,35 @@ def cmd_system_eval(args) -> int:
     )
     print("\nDev split only; held-out stays unread until the final comparison.")
     return cmd_system_report(argparse.Namespace(variant=args.variant, split="dev"))
+
+
+def guard_held_out(run_dir: Path, args) -> None:
+    """Held-out is the final, one-time score for a variant. Once it has been
+    judged, tuning against it again would turn it into a second dev split."""
+    marker = run_dir / HELD_OUT_MARKER
+    if not marker.exists() or args.force_held_out:
+        return
+    runs = json.loads(marker.read_text())
+    sys.exit(
+        f"held-out was already scored for {args.variant!r} "
+        f"({runs[-1]['at']}, {len(runs)} run(s), see {marker}). Use --split dev, "
+        "or pass --force-held-out to judge it again (the rerun is recorded)."
+    )
+
+
+def record_held_out(run_dir: Path, args, jobs: int) -> None:
+    marker = run_dir / HELD_OUT_MARKER
+    runs = json.loads(marker.read_text()) if marker.exists() else []
+    runs.append(
+        {
+            "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "set": args.set,
+            "judge_model": args.model,
+            "jobs": jobs,
+            "forced": bool(args.force_held_out),
+        }
+    )
+    marker.write_text(json.dumps(runs, indent=1) + "\n")
 
 
 def flag_id(row: dict, n: int) -> str:
@@ -1128,10 +1170,11 @@ def main() -> int:
         )
         p.add_argument("--variant", default="baseline", help="name for this prompt")
 
-    g = sub.add_parser(
-        "regen", help="summarize a set with the production prompt (paid)"
+    g = sub.add_parser("regen", help="summarize a set with a prompt variant (paid)")
+    set_args(g, "dev")
+    g.add_argument(
+        "--prompt", default="baseline", help=f"one of: {', '.join(prompts.PROMPTS)}"
     )
-    set_args(g, "all")
     g.add_argument("--model", default=sv.DEFAULT_MODEL)
     g.add_argument("--sections", default=sv.DEFAULT_SECTIONS)
     g.add_argument("--reps", type=int, default=1)
@@ -1142,8 +1185,13 @@ def main() -> int:
     e = sub.add_parser(
         "system-eval", help="checks + judge on regenerated summaries (paid)"
     )
-    set_args(e, "all")
+    set_args(e, "dev")
     e.add_argument("--model", default=JUDGE_MODEL)
+    e.add_argument(
+        "--force-held-out",
+        action="store_true",
+        help="judge held-out again for a variant that already scored it",
+    )
     e.add_argument(
         "--effort", default="medium", choices=["low", "medium", "high", "xhigh", "max"]
     )
