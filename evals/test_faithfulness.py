@@ -250,6 +250,61 @@ def test_run_parallel_records_rows_and_failures(tmp_path):
     ]
 
 
+def test_prompt_sha_tracks_the_provider():
+    assert f.prompt_sha(SECTIONS) == f.prompt_sha(SECTIONS, "anthropic")
+    assert f.prompt_sha(SECTIONS) != f.prompt_sha(SECTIONS, "openai")
+
+
+def test_regen_with_base_url_uses_the_openai_path(tmp_path, monkeypatch):
+    corpus = tmp_path
+    monkeypatch.setattr(f, "CORPUS", corpus)
+    monkeypatch.setattr(f, "EVAL_DIR", corpus / "_eval")
+    (corpus / "_eval" / "sets").mkdir(parents=True)
+    rows = [{"video": "v", "type": "list", "split": "dev"}]
+    (corpus / "_eval" / "sets" / "s.json").write_text(f.json.dumps(rows))
+    (corpus / "v").mkdir()
+    (corpus / "v" / "metadata.json").write_text(
+        f.json.dumps(SAVED_META | {"title": "T", "channel": "C"})
+    )
+    (corpus / "v" / "transcript.txt").write_text("[00:00:01] hi")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    calls = []
+
+    def fake_summarize(provider, model, meta, transcript, base_url, sections):
+        calls.append((provider, model, base_url))
+
+        class U:
+            prompt_tokens, completion_tokens = 10, 5
+
+        return "## TL;DR\nok", U()
+
+    monkeypatch.setattr(f.sv, "summarize", fake_summarize)
+    base = "http://localhost:11434/v1"
+    args = f.argparse.Namespace(
+        set="s",
+        split="all",
+        variant="local",
+        prompt="baseline",
+        model="llama3.1:8b",
+        sections=",".join(SECTIONS),
+        base_url=base,
+        reps=2,
+        workers=1,
+        dry_run=False,
+    )
+    assert f.cmd_regen(args) == 0
+    assert calls == [("openai", "llama3.1:8b", base)] * 2
+    out = corpus / "_eval" / "runs" / "gen" / "local"
+    stamp = f.json.loads((out / "variant.json").read_text())
+    assert stamp["base_url"] == base
+    assert stamp["prompt_sha"] == f.prompt_sha(SECTIONS, "openai")
+    assert (out / "v" / "rep1" / "summary.md").read_text().endswith("ok\n")
+    lines = (out / "results.jsonl").read_text().splitlines()
+    assert [f.json.loads(x)["usage"]["output_tokens"] for x in lines] == [5, 5]
+    assert all(f.json.loads(x)["cost"] is None for x in lines)
+
+
 def test_baseline_prompt_is_production_and_variants_change_the_sha(monkeypatch):
     monkeypatch.setattr(f.sv, "SUMMARY_SYSTEM", f.sv.SUMMARY_SYSTEM)
     monkeypatch.setattr(f.sv, "SECTION_PROMPTS", f.sv.SECTION_PROMPTS)

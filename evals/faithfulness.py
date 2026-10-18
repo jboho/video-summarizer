@@ -718,7 +718,7 @@ def report_flag_labels(rows: list[dict]) -> None:
 # A set file is a list of {"video": folder, "type": ..., "split": "dev" |
 # "held-out"}. Edit the prompt against dev only; score held-out once at the end.
 
-GEN_FIELDS = ("prompt_sha", "model", "sections")
+GEN_FIELDS = ("prompt_sha", "model", "sections", "base_url")
 HELD_OUT_MARKER = "held-out-runs.json"
 
 
@@ -742,15 +742,16 @@ def prompt_meta(saved: dict) -> dict:
     }
 
 
-def prompt_sha(sections: list[str]) -> str:
+def prompt_sha(sections: list[str], provider: str = "anthropic") -> str:
     """Fingerprint of everything the summarizer sends, minus the video itself:
     system prompt, user-message template, and the call's settings."""
+    call = sv.summarize_anthropic if provider == "anthropic" else sv.summarize_openai
     dummy = {"title": "T", "uploader": "C", "duration": 1, "webpage_url": "U"}
     text = "\n".join(
         [
             sv.SUMMARY_SYSTEM,
             sv.build_user_content(dummy, "", sections),
-            inspect.getsource(sv.summarize_anthropic),
+            inspect.getsource(call),
         ]
     )
     return hashlib.sha256(text.encode()).hexdigest()[:12]
@@ -764,7 +765,7 @@ def check_stamp(path: Path, stamp: dict) -> None:
         path.write_text(json.dumps(stamp, indent=1))
         return
     old = json.loads(path.read_text())
-    changed = [k for k in GEN_FIELDS if old.get(k) != stamp[k]]
+    changed = [k for k in GEN_FIELDS if old.get(k) != stamp.get(k)]
     if changed:
         sys.exit(
             f"{path.parent.name} was made with a different {', '.join(changed)}; "
@@ -792,6 +793,9 @@ def cmd_regen(args) -> int:
     videos = load_set(args.set, args.split)
     sections = sv.parse_sections(args.sections)
     out = gen_dir(args.variant)
+    # --base-url sends the same prompt to an OpenAI-compatible endpoint, e.g.
+    # local Ollama, instead of the Anthropic SDK.
+    provider = "openai" if args.base_url else "anthropic"
     jobs = [
         (r, rep)
         for r in videos
@@ -799,9 +803,10 @@ def cmd_regen(args) -> int:
         if not (out / r["video"] / f"rep{rep}" / "summary.md").exists()
     ]
     stamp = {
-        "prompt_sha": prompt_sha(sections),
+        "prompt_sha": prompt_sha(sections, provider),
         "model": args.model,
         "sections": sections,
+        "base_url": args.base_url,
     }
     if args.dry_run:
         chars = sum(
@@ -815,7 +820,10 @@ def cmd_regen(args) -> int:
         for r, rep in jobs:
             print(f"  {r['split']:8} {r['type']:19} rep{rep} {r['video']}")
         return 0
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    if provider == "openai":
+        # Local runtimes ignore the key, but the SDK requires one.
+        os.environ.setdefault("OPENAI_API_KEY", "not-needed")
+    elif not os.environ.get("ANTHROPIC_API_KEY"):
         sys.exit("ANTHROPIC_API_KEY is not set")
     check_stamp(out / "variant.json", stamp)
     print(f"{len(jobs)} summaries to write -> {out}", flush=True)
@@ -825,10 +833,15 @@ def cmd_regen(args) -> int:
         saved = json.loads((vdir / "metadata.json").read_text())
         transcript = (vdir / "transcript.txt").read_text()
         start = time.monotonic()
-        text, usage = sv.summarize_anthropic(
-            args.model, prompt_meta(saved), transcript, sections
+        text, usage = sv.summarize(
+            provider,
+            args.model,
+            prompt_meta(saved),
+            transcript,
+            args.base_url,
+            sections,
         )
-        tokens = sv.normalize_usage("anthropic", usage)
+        tokens = sv.normalize_usage(provider, usage)
         row = {
             "video": r["video"],
             "rep": rep,
@@ -1170,13 +1183,19 @@ def main() -> int:
         )
         p.add_argument("--variant", default="baseline", help="name for this prompt")
 
-    g = sub.add_parser("regen", help="summarize a set with a prompt variant (paid)")
+    g = sub.add_parser(
+        "regen", help="summarize a set with a prompt variant (paid unless --base-url)"
+    )
     set_args(g, "dev")
     g.add_argument(
         "--prompt", default="baseline", help=f"one of: {', '.join(prompts.PROMPTS)}"
     )
     g.add_argument("--model", default=sv.DEFAULT_MODEL)
     g.add_argument("--sections", default=sv.DEFAULT_SECTIONS)
+    g.add_argument(
+        "--base-url",
+        help="OpenAI-compatible endpoint, e.g. http://localhost:11434/v1 for Ollama",
+    )
     g.add_argument("--reps", type=int, default=1)
     g.add_argument("--workers", type=int, default=4)
     g.add_argument("--dry-run", action="store_true")
