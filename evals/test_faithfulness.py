@@ -285,6 +285,7 @@ def test_regen_with_base_url_uses_the_openai_path(tmp_path, monkeypatch):
         set="s",
         split="all",
         variant="local",
+        prompt="baseline",
         model="llama3.1:8b",
         sections=",".join(SECTIONS),
         base_url=base,
@@ -302,3 +303,72 @@ def test_regen_with_base_url_uses_the_openai_path(tmp_path, monkeypatch):
     lines = (out / "results.jsonl").read_text().splitlines()
     assert [f.json.loads(x)["usage"]["output_tokens"] for x in lines] == [5, 5]
     assert all(f.json.loads(x)["cost"] is None for x in lines)
+
+
+def test_baseline_prompt_is_production_and_variants_change_the_sha(monkeypatch):
+    monkeypatch.setattr(f.sv, "SUMMARY_SYSTEM", f.sv.SUMMARY_SYSTEM)
+    monkeypatch.setattr(f.sv, "SECTION_PROMPTS", f.sv.SECTION_PROMPTS)
+    before = f.prompt_sha(SECTIONS)
+    f.prompts.apply_prompt("baseline")
+    assert f.prompt_sha(SECTIONS) == before
+    f.prompts.apply_prompt("grounded-v1")
+    assert f.prompt_sha(SECTIONS) != before
+    f.prompts.apply_prompt("baseline")
+    assert f.prompt_sha(SECTIONS) == before
+    with pytest.raises(SystemExit, match="unknown --prompt"):
+        f.prompts.apply_prompt("nope")
+
+
+def test_variant_sections_keep_the_production_headers():
+    for name, entry in f.prompts.PROMPTS.items():
+        for key, text in entry.get("sections", {}).items():
+            base = f.prompts.BASE_SECTIONS[key].splitlines()[0]
+            assert text.splitlines()[0] == base, (name, key)
+
+
+def _held_out_setup(tmp_path, monkeypatch):
+    monkeypatch.setattr(f, "EVAL_DIR", tmp_path)
+    monkeypatch.setattr(f, "CORPUS", tmp_path)
+    (tmp_path / "sets").mkdir()
+    rows = [{"video": "a", "type": "t", "split": "held-out"}]
+    (tmp_path / "sets" / "s.json").write_text(f.json.dumps(rows))
+    rdir = tmp_path / "runs" / "gen" / "v" / "a" / "rep0"
+    rdir.mkdir(parents=True)
+    (rdir / "summary.md").write_text("s")
+    (tmp_path / "a").mkdir()
+    (tmp_path / "a" / "transcript.txt").write_text("t")
+    (rdir.parent.parent / "variant.json").write_text(f.json.dumps({"sections": []}))
+    return f.argparse.Namespace(
+        set="s",
+        split="held-out",
+        variant="v",
+        model="m",
+        dry_run=True,
+        force_held_out=False,
+    )
+
+
+def test_system_eval_refuses_a_second_held_out_run(tmp_path, monkeypatch, capsys):
+    args = _held_out_setup(tmp_path, monkeypatch)
+    assert f.cmd_system_eval(args) == 0
+    run_dir = f.system_dir("v")
+    run_dir.mkdir(parents=True)
+    f.record_held_out(run_dir, args, 1)
+    with pytest.raises(SystemExit, match="already scored"):
+        f.cmd_system_eval(args)
+    args.force_held_out = True
+    assert f.cmd_system_eval(args) == 0
+    f.record_held_out(run_dir, args, 1)
+    runs = f.json.loads((run_dir / f.HELD_OUT_MARKER).read_text())
+    assert [r["forced"] for r in runs] == [False, True]
+
+
+def test_system_eval_dev_ignores_the_held_out_guard(tmp_path, monkeypatch):
+    args = _held_out_setup(tmp_path, monkeypatch)
+    run_dir = f.system_dir("v")
+    run_dir.mkdir(parents=True)
+    f.record_held_out(run_dir, args, 1)
+    rows = [{"video": "a", "type": "t", "split": "dev"}]
+    (tmp_path / "sets" / "s.json").write_text(f.json.dumps(rows))
+    args.split = "dev"
+    assert f.cmd_system_eval(args) == 0
