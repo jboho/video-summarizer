@@ -79,22 +79,25 @@ arvio
 
 `label-export` writes the flags into `runs/system/VARIANT/label-dev/`, an arvio
 task folder, and arvio writes your labels there. Run it again after
-`system-eval` adds results. A summary line flagged again, in another rep or
-variant, keeps its id (made from the video, the line and the quoted text), so
-you label it once: the export leaves out flags already labeled in another
+`system-eval` adds results. Stop arvio first (Ctrl-C in its terminal): while it
+runs it locks every task folder it knows, and `label-export` refuses a locked
+folder. The same quote on the same summary line, flagged again in another rep
+or variant, keeps its id (made from the video, the line and the quoted text),
+so you label it once: the export leaves out flags already labeled in another
 label folder. That works only for labels that exist when you export, so
 export, label and Finish one variant before you export the next. Only labels
 from a finished session count (Finish locks them).
 
-The report then shows how many flagged lines are labeled (a line flagged in
-several summaries counts once), the judge's precision on them with a 95% CI,
-and, once every flag is labeled, real errors per summary and the share of
-summaries with no real major error. Compare variants on labeled real errors,
-and read the precision line before trusting raw counts. A flag with an empty
-`summary_quote` has nothing to show, so it can't be labeled; while any summary
-has one, the report leaves out real errors per summary and says why. If one
-line has different answers in two label folders, the report says how many and
-uses a finished label first, then the latest.
+The report then shows how many flagged lines are labeled (the same quote on
+the same line, flagged in several summaries, counts once), the judge's
+precision on them with a 95% CI, and, once every flag is labeled, real errors
+per summary and the share of summaries with no real major error. Compare
+variants on labeled real errors, and read the precision line before trusting
+raw counts. A flag with an empty `summary_quote` has nothing to show, so it
+can't be labeled; while any summary has one, the report leaves out real errors
+per summary and says why. If one line has a different answer or severity in
+two label folders, the report says how many and uses a finished label first,
+then the latest.
 
 Any change to the task card, even to its title, marks the older label folders
 stale in the report until you run `label-export` for them again. Do that

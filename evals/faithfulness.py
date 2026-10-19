@@ -988,8 +988,12 @@ def cmd_system_eval(args) -> int:
         workers=args.workers,
     )
     print("\nDev split only; held-out stays unread until the final comparison.")
-    # The paid run worked; a label problem is printed, not turned into a failure.
-    cmd_system_report(argparse.Namespace(variant=args.variant, split="dev"))
+    # The paid run worked; a label problem, or no dev rows after a held-out
+    # run, is printed, not turned into a failure.
+    try:
+        cmd_system_report(argparse.Namespace(variant=args.variant, split="dev"))
+    except SystemExit as e:
+        print(e)
     return 0
 
 
@@ -1293,7 +1297,10 @@ def flag_item(
     else:
         line = lines[hits[0]]
         shown = summary_section(lines, hits[0])
-        mark = marked_span(line, quote) or line.strip()
+        # arvio highlights every copy of the mark in the block, so a quote
+        # that recurs in the section marks its whole line instead.
+        span = marked_span(line, quote)
+        mark = span if span and shown.count(span) == 1 else line.strip()
         where = "" if len(hits) == 1 else f" (on {len(hits)} lines; the first shown)"
         times = [_seconds(*m.groups()) for m in TS_RE.finditer(line)]
     times += [
@@ -1473,11 +1480,11 @@ def current_labels(
 ) -> tuple[dict[str, dict], list[Path], set[str]]:
     """The label per flag key across every label folder made with today's
     card, a locked one first, then the latest; the folders whose card is
-    older; and the keys labeled in more than one folder with different
-    answers."""
+    older; and the keys labeled in more than one folder with a different
+    answer or severity."""
     card = label_card()
     labels: dict[str, dict] = {}
-    answers: dict[str, set[str]] = {}
+    answers: dict[str, set[tuple[str, str | None]]] = {}
     stale = []
     folders = sorted(
         task
@@ -1492,7 +1499,8 @@ def current_labels(
             continue
         for row in read_labels(task):
             key = row["item_id"]
-            answers.setdefault(key, set()).add(row["answer"])
+            severity = (row.get("followups") or {}).get("severity")
+            answers.setdefault(key, set()).add((row["answer"], severity))
             have = labels.get(key)
             rank = (row["locked"], row.get("labeled_at", ""))
             if have is None or rank > (have["locked"], have.get("labeled_at", "")):
@@ -1507,10 +1515,32 @@ def ok_rows(variant: str, split: str) -> list[dict]:
 
 
 def cmd_label_export(args) -> int:
+    task = label_task(args.variant, args.split)
+    if not task.exists():
+        return export_labels(args, task)
+    # The same lock arvio's server holds on every task folder it serves, so
+    # an export can't change items under a labeling session. arvio needs
+    # fcntl, so this runs only where arvio can.
+    import fcntl
+
+    fd = os.open(task, os.O_RDONLY)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            sys.exit(
+                f"arvio is serving {task}; stop it (Ctrl-C in its terminal) and "
+                "run label-export again. Nothing was written."
+            )
+        return export_labels(args, task)
+    finally:
+        os.close(fd)
+
+
+def export_labels(args, task: Path) -> int:
     part = ok_rows(args.variant, args.split)
     if not part:
         sys.exit(f"no judged summaries for {args.variant!r} in split {args.split!r}")
-    task = label_task(args.variant, args.split)
     try:
         elsewhere, stale, _ = current_labels(skip=task)
     except (LabelError, OSError, ValueError) as e:
@@ -1578,7 +1608,7 @@ def cmd_label_export(args) -> int:
             items[key] = fresh[key]
     if file_stamp(labels_path) != seen:
         sys.exit(
-            f"{labels_path} changed while exporting (is arvio open on it?). "
+            f"{labels_path} changed while exporting. "
             f"Nothing was written to {task}; run label-export again."
         )
     task.mkdir(parents=True, exist_ok=True)
@@ -1638,8 +1668,8 @@ def report_labels(part: list[dict], variant: str, split: str) -> None:
     )
     if len(lines) < len(keys) - empty:
         print(
-            f"  from {len(keys) - empty} flags: a line flagged in more than one "
-            "summary counts once"
+            f"  from {len(keys) - empty} flags: the same quote on the same line, "
+            "flagged in more than one summary, counts once"
         )
     if empty:
         print(f"  {empty} flags with an empty summary_quote can't be labeled")
@@ -1651,12 +1681,13 @@ def report_labels(part: list[dict], variant: str, split: str) -> None:
         )
     if differ := sum(k in mixed for k in lines):
         print(
-            f"  {differ} flagged lines have different answers in two label "
-            "folders; the report uses a finished label first, then the latest"
+            f"  {differ} flagged lines have a different answer or severity in "
+            "two label folders; the report uses a finished label first, then "
+            "the latest"
         )
     flagged = {r["split"] for r, ks in zip(part, per_row, strict=True) if any(ks)}
     for s in sorted(flagged):
-        if not label_task(variant, s).exists():
+        if not (label_task(variant, s) / "task.toml").exists():
             print(f"  label them: label-export --variant {variant} --split {s}")
     if real + false:
         lo, hi = wilson(real, real + false)
@@ -1686,8 +1717,8 @@ def report_labels(part: list[dict], variant: str, split: str) -> None:
     m, sd = mean_sd([float(x) for x in per])
     lo, hi = wilson(clean, len(part))
     print(
-        f"  real errors per summary: mean {m:.2f} (sd {sd:.2f}; a line flagged "
-        "twice in one summary counts once); "
+        f"  real errors per summary: mean {m:.2f} (sd {sd:.2f}; the same quote "
+        "flagged twice in one summary counts once); "
         f"summaries with no real major error: {clean}/{len(part)} "
         f"(95% CI {lo:.2f}-{hi:.2f}; two reps of one video are not "
         "independent; counts only errors the judge flagged"
