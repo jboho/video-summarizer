@@ -988,12 +988,16 @@ def cmd_system_eval(args) -> int:
         workers=args.workers,
     )
     print("\nDev split only; held-out stays unread until the final comparison.")
-    # The paid run worked; a label problem, or no dev rows after a held-out
-    # run, is printed, not turned into a failure.
-    try:
-        cmd_system_report(argparse.Namespace(variant=args.variant, split="dev"))
-    except SystemExit as e:
-        print(e)
+    if not ok_rows(args.variant, "dev"):
+        if any(r["split"] == "dev" for r, _, _ in jobs):
+            sys.exit(
+                "no dev summary came back judged; see "
+                f"{run_dir / 'errors.jsonl'} and the truncated rows"
+            )
+        print("no dev summaries to report")
+        return 0
+    # The paid run worked, so a label problem is printed, not a failure.
+    cmd_system_report(argparse.Namespace(variant=args.variant, split="dev"))
     return 0
 
 
@@ -1298,9 +1302,12 @@ def flag_item(
         line = lines[hits[0]]
         shown = summary_section(lines, hits[0])
         # arvio highlights every copy of the mark in the block, so a quote
-        # that recurs in the section marks its whole line instead.
+        # that recurs in the section marks its whole line instead, and a line
+        # that recurs too is shown alone.
         span = marked_span(line, quote)
         mark = span if span and shown.count(span) == 1 else line.strip()
+        if shown.count(mark) != 1:
+            shown = mark
         where = "" if len(hits) == 1 else f" (on {len(hits)} lines; the first shown)"
         times = [_seconds(*m.groups()) for m in TS_RE.finditer(line)]
     times += [
@@ -1515,12 +1522,15 @@ def ok_rows(variant: str, split: str) -> list[dict]:
 
 
 def cmd_label_export(args) -> int:
+    part = ok_rows(args.variant, args.split)
+    if not part:
+        sys.exit(f"no judged summaries for {args.variant!r} in split {args.split!r}")
     task = label_task(args.variant, args.split)
-    if not task.exists():
-        return export_labels(args, task)
+    task.mkdir(exist_ok=True)
     # The same lock arvio's server holds on every task folder it serves, so
-    # an export can't change items under a labeling session. arvio needs
-    # fcntl, so this runs only where arvio can.
+    # an export can't change items under a labeling session. A new folder is
+    # locked too: a server that still lists a deleted one takes it back once
+    # it exists. arvio needs fcntl, so this runs only where arvio can.
     import fcntl
 
     fd = os.open(task, os.O_RDONLY)
@@ -1529,18 +1539,16 @@ def cmd_label_export(args) -> int:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             sys.exit(
-                f"arvio is serving {task}; stop it (Ctrl-C in its terminal) and "
-                "run label-export again. Nothing was written."
+                f"arvio or another label-export is using {task}; stop arvio "
+                "(Ctrl-C in its terminal) and run label-export again. "
+                "Nothing was written."
             )
-        return export_labels(args, task)
+        return export_labels(args, task, part)
     finally:
         os.close(fd)
 
 
-def export_labels(args, task: Path) -> int:
-    part = ok_rows(args.variant, args.split)
-    if not part:
-        sys.exit(f"no judged summaries for {args.variant!r} in split {args.split!r}")
+def export_labels(args, task: Path, part: list[dict]) -> int:
     try:
         elsewhere, stale, _ = current_labels(skip=task)
     except (LabelError, OSError, ValueError) as e:
@@ -1611,7 +1619,6 @@ def export_labels(args, task: Path) -> int:
             f"{labels_path} changed while exporting. "
             f"Nothing was written to {task}; run label-export again."
         )
-    task.mkdir(parents=True, exist_ok=True)
     card = task / "task.toml"
     if card.exists() and card.read_text(encoding="utf-8") != label_card():
         print(f"updated the card in {task}. {CARD_CHANGE_NOTE}")
@@ -1627,7 +1634,7 @@ def export_labels(args, task: Path) -> int:
     current = sum(key in fresh for key in items)
     print(
         f"{flags} judge flags in {len(part)} summaries -> {current} items "
-        f"({repeats} repeats of a flagged line, {skipped} already labeled "
+        f"({repeats} repeats of a flagged quote, {skipped} already labeled "
         f"in another label folder) -> {task}"
     )
     if empty:
@@ -1654,34 +1661,34 @@ def report_labels(part: list[dict], variant: str, split: str) -> None:
         return
     print("labels (arvio):")
     empty = keys.count(None)
-    lines = list(dict.fromkeys(k for k in keys if k is not None))
+    quotes = list(dict.fromkeys(k for k in keys if k is not None))
     labels, stale, mixed = current_labels()
     for task in stale:
         print(f"  {task} has an older card; run label-export {export_args(task)}")
     done = {k: v for k, v in labels.items() if v["locked"]}
-    answers = [done[k]["answer"] if k in done else None for k in lines]
+    answers = [done[k]["answer"] if k in done else None for k in quotes]
     real, false = answers.count("real"), answers.count("false_alarm")
     unsure = answers.count("cant_tell")
     print(
-        f"  flagged lines labeled: {real + false + unsure}/{len(lines)} "
+        f"  flagged quotes labeled: {real + false + unsure}/{len(quotes)} "
         f"(real {real}, false alarm {false}, can't tell {unsure})"
     )
-    if len(lines) < len(keys) - empty:
+    if len(quotes) < len(keys) - empty:
         print(
             f"  from {len(keys) - empty} flags: the same quote on the same line, "
             "flagged in more than one summary, counts once"
         )
     if empty:
         print(f"  {empty} flags with an empty summary_quote can't be labeled")
-    unfinished = sum(1 for k in lines if k in labels and k not in done)
+    unfinished = sum(1 for k in quotes if k in labels and k not in done)
     if unfinished:
         print(
             f"  {unfinished} more labeled in an arvio session not finished yet; "
             "they count after Finish"
         )
-    if differ := sum(k in mixed for k in lines):
+    if differ := sum(k in mixed for k in quotes):
         print(
-            f"  {differ} flagged lines have a different answer or severity in "
+            f"  {differ} flagged quotes have a different answer or severity in "
             "two label folders; the report uses a finished label first, then "
             "the latest"
         )
@@ -1692,8 +1699,8 @@ def report_labels(part: list[dict], variant: str, split: str) -> None:
     if real + false:
         lo, hi = wilson(real, real + false)
         print(
-            f"  judge precision on labeled lines: {real}/{real + false} "
-            f"(95% CI {lo:.2f}-{hi:.2f}; can't tell left out; lines from one "
+            f"  judge precision on labeled quotes: {real}/{real + false} "
+            f"(95% CI {lo:.2f}-{hi:.2f}; can't tell left out; quotes from one "
             "video are not independent)"
         )
     if None in answers:

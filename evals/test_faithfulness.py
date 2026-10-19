@@ -1,3 +1,4 @@
+import importlib.util
 import os
 import shutil
 import tomllib
@@ -10,6 +11,13 @@ import pytest
 needs_arvio = pytest.mark.skipif(
     shutil.which("arvio") is None and os.environ.get("REQUIRE_ARVIO") != "1",
     reason="arvio is not installed",
+)
+# The lock test imports arvio's own lock, so it needs the package, not only the
+# command.
+needs_arvio_package = pytest.mark.skipif(
+    importlib.util.find_spec("arvio") is None
+    and os.environ.get("REQUIRE_ARVIO") != "1",
+    reason="the arvio package is not importable",
 )
 
 TRANSCRIPT = """\
@@ -414,6 +422,20 @@ def test_every_highlight_is_an_exact_part_of_its_block():
                 assert h and block["text"].count(h) == 1, quote
 
 
+def test_a_line_that_recurs_in_its_section_is_shown_alone():
+    saved = {"title": "T", "duration": "00:01:00"}
+    for second in ["- Use 8 GPU layers. It crashed.", "- Use 8 GPU layers."]:
+        summary = SUMMARY.replace(
+            "- Point [00:00:32].", "- Use 8 GPU layers.\n" + second
+        )
+        item = f.flag_item(
+            _row(0, []), _issue("8 gpu layers"), summary, TRANSCRIPT, saved, "b"
+        )
+        block = item["display"][1]
+        assert block["text"] == "- Use 8 GPU layers."
+        assert block["highlight"] == ["- Use 8 GPU layers."]
+
+
 def test_a_quote_that_recurs_in_its_section_marks_the_whole_line():
     summary = SUMMARY.replace(
         "- Point [00:00:32].",
@@ -590,13 +612,27 @@ def test_label_export_refuses_while_arvio_serves_the_folder(tmp_path, monkeypatc
     fd = f.os.open(task, f.os.O_RDONLY)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        with pytest.raises(SystemExit, match="arvio is serving"):
+        with pytest.raises(SystemExit, match="arvio or another label-export"):
             f.cmd_label_export(args)
     finally:
         f.os.close(fd)
     assert not (task / "items.jsonl").exists()
     f.cmd_label_export(args)
     assert (task / "items.jsonl").exists()
+
+
+@needs_arvio_package
+def test_label_export_refuses_a_folder_arvio_has_locked(tmp_path, monkeypatch):
+    from arvio import store
+
+    args = _export_setup(tmp_path, monkeypatch, [_row(0, [_issue()])])
+    f.cmd_label_export(args)
+    task = f.label_task("base", "dev")
+    (task / "items.jsonl").unlink()
+    with store.locked(task, wait=False):
+        with pytest.raises(SystemExit, match="arvio or another label-export"):
+            f.cmd_label_export(args)
+    assert not (task / "items.jsonl").exists()
 
 
 def test_label_export_without_arvio_gives_only_the_install_advice(
@@ -748,10 +784,10 @@ def test_report_labels_counts_finished_labels_and_precision(
     f.report_labels(part, "base", "dev")
     out = capsys.readouterr().out
     assert "has an older card; run label-export --variant old --split dev" in out
-    assert "flagged lines labeled: 3/5 (real 2, false alarm 1, can't tell 0)" in out
+    assert "flagged quotes labeled: 3/5 (real 2, false alarm 1, can't tell 0)" in out
     assert "1 more labeled in an arvio session not finished yet" in out
     lo, hi = f.wilson(2, 3)
-    assert f"judge precision on labeled lines: 2/3 (95% CI {lo:.2f}-{hi:.2f}" in out
+    assert f"judge precision on labeled quotes: 2/3 (95% CI {lo:.2f}-{hi:.2f}" in out
     assert "real errors per summary" not in out
     assert "label them" not in out
 
@@ -774,12 +810,12 @@ def test_report_labels_counts_a_repeated_line_once(tmp_path, monkeypatch, capsys
     (f.label_task("base", "dev") / "task.toml").write_text(f.label_card())
     f.report_labels(part, "base", "dev")
     out = capsys.readouterr().out
-    assert "flagged lines labeled: 1/1" in out
+    assert "flagged quotes labeled: 1/1" in out
     assert (
         "from 3 flags: the same quote on the same line, flagged in more than "
         "one summary, counts once" in out
     )
-    assert "judge precision on labeled lines: 1/1" in out
+    assert "judge precision on labeled quotes: 1/1" in out
     assert "real errors per summary: mean 1.00" in out
     assert "no real major error: 2/2" in out
 
@@ -795,7 +831,7 @@ def test_report_labels_says_why_a_count_is_missing(tmp_path, monkeypatch, capsys
     (other / "task.toml").write_text(f.label_card())
     f.report_labels(part, "base", "dev")
     out = capsys.readouterr().out
-    assert "flagged lines labeled: 1/1" in out
+    assert "flagged quotes labeled: 1/1" in out
     assert "real errors per summary not shown: the flags with an empty" in out
     assert "different answer" not in out
 
@@ -806,7 +842,7 @@ def test_report_labels_says_why_a_count_is_missing(tmp_path, monkeypatch, capsys
     rows[f.label_task("base", "dev")] = [_label(_key(QUOTE), "real")]
     f.report_labels(part, "base", "dev")
     assert (
-        "1 flagged lines have a different answer or severity in two label folders"
+        "1 flagged quotes have a different answer or severity in two label folders"
         in (capsys.readouterr().out)
     )
 
@@ -818,7 +854,7 @@ def test_report_labels_says_how_to_start(tmp_path, monkeypatch, capsys):
     f.label_task("base", "held-out").mkdir(parents=True)
     f.report_labels(part, "base", "all")
     out = capsys.readouterr().out
-    assert "flagged lines labeled: 0/1" in out
+    assert "flagged quotes labeled: 0/1" in out
     assert "1 flags with an empty summary_quote can't be labeled" in out
     assert "label-export --variant base --split dev" in out
     # An empty folder isn't a task yet, so its hint stays.
@@ -888,7 +924,11 @@ def test_system_eval_succeeds_when_only_the_labels_fail(tmp_path, monkeypatch):
     args.split, args.dry_run = "dev", False
     args.effort, args.timeout_s, args.workers = "medium", 1, 1
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    monkeypatch.setattr(f, "run_parallel", lambda *a, **kw: None)
+
+    def judged(jobs, one, results_path, **kw):
+        results_path.write_text(f.json.dumps(_row(0, [], video="a")) + "\n")
+
+    monkeypatch.setattr(f, "run_parallel", judged)
     reports = []
     monkeypatch.setattr(f, "cmd_system_report", lambda a: reports.append(a) or 1)
     assert f.cmd_system_eval(args) == 0
@@ -906,7 +946,36 @@ def test_held_out_system_eval_succeeds_with_no_dev_rows(tmp_path, monkeypatch, c
 
     monkeypatch.setattr(f, "run_parallel", judged)
     assert f.cmd_system_eval(args) == 0
-    assert "no judged summaries in split 'dev'" in capsys.readouterr().out
+    assert "no dev summaries to report" in capsys.readouterr().out
+
+
+def test_dev_system_eval_fails_when_no_dev_summary_comes_back(
+    tmp_path, monkeypatch, capsys
+):
+    args = _held_out_setup(tmp_path, monkeypatch)
+    rows = [
+        {"video": "a", "type": "t", "split": "held-out"},
+        {"video": "b", "type": "t", "split": "dev"},
+    ]
+    (tmp_path / "sets" / "s.json").write_text(f.json.dumps(rows))
+    rdir = f.gen_dir("v") / "b" / "rep0"
+    rdir.mkdir(parents=True)
+    (rdir / "summary.md").write_text("s")
+    (tmp_path / "b").mkdir()
+    (tmp_path / "b" / "transcript.txt").write_text("t")
+    run_dir = f.system_dir("v")
+    run_dir.mkdir(parents=True)
+    held = _row(0, [], video="a") | {"split": "held-out"}
+    (run_dir / "results.jsonl").write_text(f.json.dumps(held) + "\n")
+    args.split, args.dry_run = "dev", False
+    args.effort, args.timeout_s, args.workers = "medium", 1, 1
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    calls = []
+    # Every judge call fails: run_parallel records it in errors.jsonl.
+    monkeypatch.setattr(f, "run_parallel", lambda jobs, one, **kw: calls.extend(jobs))
+    with pytest.raises(SystemExit, match="no dev summary came back judged"):
+        f.cmd_system_eval(args)
+    assert [r["video"] for r, _, _ in calls] == ["b"]
 
 
 @needs_arvio
@@ -1006,13 +1075,13 @@ def test_report_reads_real_arvio_labels(tmp_path, monkeypatch, capsys):
     capsys.readouterr()
     f.report_labels(rows, "base", "dev")
     out = capsys.readouterr().out
-    assert "flagged lines labeled: 1/2 (real 1, false alarm 0" in out
+    assert "flagged quotes labeled: 1/2 (real 1, false alarm 0" in out
     assert "1 more labeled in an arvio session not finished yet" in out
     log.append({"kind": "reveal", "item_ids": keys[1:], "task_version": v})
     (task / "labels.jsonl").write_text(f.jsonl(log))
     f.report_labels(rows, "base", "dev")
     out = capsys.readouterr().out
-    assert "flagged lines labeled: 2/2 (real 1, false alarm 1" in out
+    assert "flagged quotes labeled: 2/2 (real 1, false alarm 1" in out
     assert "real errors per summary: mean 1.00" in out
     assert "no real major error: 0/1" in out
 

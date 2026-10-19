@@ -88,14 +88,14 @@ label folder. That works only for labels that exist when you export, so
 export, label and Finish one variant before you export the next. Only labels
 from a finished session count (Finish locks them).
 
-The report then shows how many flagged lines are labeled (the same quote on
+The report then shows how many flagged quotes are labeled (the same quote on
 the same line, flagged in several summaries, counts once), the judge's
 precision on them with a 95% CI, and, once every flag is labeled, real errors
 per summary and the share of summaries with no real major error. Compare
 variants on labeled real errors, and read the precision line before trusting
 raw counts. A flag with an empty `summary_quote` has nothing to show, so it
 can't be labeled; while any summary has one, the report leaves out real errors
-per summary and says why. If one line has a different answer or severity in
+per summary and says why. If one quote has a different answer or severity in
 two label folders, the report says how many and uses a finished label first,
 then the latest.
 
