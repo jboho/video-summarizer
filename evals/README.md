@@ -8,7 +8,7 @@ command lists its flags. The data lives outside this repo:
 VIDEO_SUMMARY_DIR=~/Code/video-summaries     # transcripts, one folder per video
 $VIDEO_SUMMARY_DIR/_eval/sets/phase2.json    # 20 videos: 12 dev, 8 held-out
 $VIDEO_SUMMARY_DIR/_eval/runs/gen/VARIANT/   # summaries made by regen
-$VIDEO_SUMMARY_DIR/_eval/runs/system/VARIANT/  # judge results, labels files
+$VIDEO_SUMMARY_DIR/_eval/runs/system/VARIANT/  # judge results, label tasks
 ```
 
 Set `VIDEO_SUMMARY_DIR` first; the default is `~/Documents/video-summaries`.
@@ -61,14 +61,54 @@ The report gives judge flags per summary and per 100 claims, the share of
 summaries with no major flag (with a 95% CI), a breakdown by category and
 video type, the rep0-vs-rep1 gap, and the deterministic check errors.
 
-**Dev scoring needs labels.** A judge flag is only a candidate error. Each
-report writes `runs/system/VARIANT/labels-dev.json` with one entry per flag;
-set `verdict` to `"real"` or `"false_alarm"` (and add a `note` if useful).
-Re-running the report keeps verdicts already filled in. Until the flags are
-labeled, flag counts mix real errors with judge mistakes, so a drop in flags
-can mean the prompt got better or the judge got quieter. Compare variants on
-labeled real errors, and read the judge precision line before trusting raw
-counts. The baseline's file is `runs/system/baseline/labels-dev.json`.
+**Dev scoring needs labels.** A judge flag is only a candidate error. Until
+the flags are labeled, flag counts mix real errors with judge mistakes, so a
+drop in flags can mean the prompt got better or the judge got quieter. Label
+them in [arvio](https://github.com/jboho/arvio), a small local labeling page.
+It shows one flag at a time with the rules, the summary section, and the
+transcript a minute either side of the times the summary cites and of the time
+the judge pointed to. It keeps the judge's answer hidden until you finish a
+session.
+
+```
+uv tool install git+https://github.com/jboho/arvio@v0.1.0   # once
+uv run evals/faithfulness.py label-export --variant grounded-v1
+arvio add $VIDEO_SUMMARY_DIR/_eval/runs/system/grounded-v1/label-dev  # once
+arvio
+```
+
+`label-export` writes the flags into `runs/system/VARIANT/label-dev/`, an arvio
+task folder, and arvio writes your labels there. Run it again after
+`system-eval` adds results. Stop arvio first (Ctrl-C in its terminal): while it
+runs it locks every task folder it knows, and `label-export` refuses a locked
+folder. The same quote on the same summary line, flagged again in another rep
+or variant, keeps its id (made from the video, the line and the quoted text),
+so you label it once: the export leaves out flags already labeled in another
+label folder. That works only for labels that exist when you export, so
+export, label and Finish one variant before you export the next. Only labels
+from a finished session count (Finish locks them).
+
+The report then shows how many flagged quotes are labeled (the same quote on
+the same line, flagged in several summaries, counts once), the judge's
+precision on them with a 95% CI, and, once every flag is labeled, real errors
+per summary and the share of summaries with no real major error. Compare
+variants on labeled real errors, and read the precision line before trusting
+raw counts. A flag with an empty `summary_quote` has nothing to show, so it
+can't be labeled; while any summary has one, the report leaves out real errors
+per summary and says why. If one quote has a different answer or severity in
+two label folders, the report says how many and uses a finished label first,
+then the latest.
+
+Any change to the task card, even to its title, marks the older label folders
+stale in the report until you run `label-export` for them again. Do that
+before you export a new variant: the export can't see a stale folder's labels,
+so it would ask for those flags again. After that, their labels count again
+unless the judge prompt, the labeling rules, the question, the choices or the
+follow-ups changed: the card's pin is a hash of the judge prompt and the
+rules. Labels made under an older card stay in `labels.jsonl` but no longer
+count. A known limit: `results.jsonl` rows don't record which judge prompt
+produced them, so after a judge prompt change, rows judged before and after it
+sit in one variant's results unmarked.
 
 The variants are summarized with the same model and judged by the same judge,
 so a difference is the prompt's. Twelve dev videos is a small sample: treat a
@@ -94,7 +134,8 @@ uv run evals/faithfulness.py system-report --variant baseline --split held-out
 `runs/system/VARIANT/held-out-runs.json` and refuses a second held-out run of
 the same variant (`--split held-out` or `--split all`). `--force-held-out`
 overrides that, and the forced run is recorded too. Re-printing the report is
-free and allowed. Label `labels-held-out.json` the same way before comparing.
+free and allowed. Label the held-out flags the same way (`label-export --split
+held-out`) before comparing.
 If the held-out result disagrees with dev, report that; don't go back to step 1
 and tune against held-out.
 
