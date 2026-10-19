@@ -469,7 +469,7 @@ def _export_setup(tmp_path, monkeypatch, rows: list[dict], variant: str = "base"
     return f.argparse.Namespace(variant=variant, split="dev")
 
 
-def test_label_export_writes_one_item_per_flagged_line(tmp_path, monkeypatch, capsys):
+def test_label_export_writes_one_item_per_flagged_quote(tmp_path, monkeypatch, capsys):
     other = _issue("Point [00:00:32].", transcript_ts="[00:00:32]")
     rows = [_row(0, [_issue(), other]), _row(1, [_issue()]), _row(2, [])]
     args = _export_setup(tmp_path, monkeypatch, rows)
@@ -633,6 +633,37 @@ def test_label_export_refuses_a_folder_arvio_has_locked(tmp_path, monkeypatch):
         with pytest.raises(SystemExit, match="arvio or another label-export"):
             f.cmd_label_export(args)
     assert not (task / "items.jsonl").exists()
+
+
+def test_label_export_locks_a_folder_it_creates(tmp_path, monkeypatch):
+    args = _export_setup(tmp_path, monkeypatch, [_row(0, [_issue()])])
+    task = f.label_task("base", "dev")
+    assert not task.exists()
+    held = []
+
+    def export(args, folder, part):
+        import fcntl
+
+        fd = os.open(folder, os.O_RDONLY)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            held.append(folder)
+        finally:
+            os.close(fd)
+        return 0
+
+    monkeypatch.setattr(f, "export_labels", export)
+    assert f.cmd_label_export(args) == 0
+    assert held == [task]
+
+
+def test_label_export_of_an_unknown_variant_leaves_no_folder(tmp_path, monkeypatch):
+    _export_setup(tmp_path, monkeypatch, [_row(0, [_issue()])])
+    args = f.argparse.Namespace(variant="typo", split="dev")
+    with pytest.raises(SystemExit, match="no judged summaries for 'typo'"):
+        f.cmd_label_export(args)
+    assert not f.system_dir("typo").exists()
 
 
 def test_label_export_without_arvio_gives_only_the_install_advice(
@@ -800,7 +831,7 @@ def test_report_labels_counts_finished_labels_and_precision(
     assert "can't tell counted as no error" in out
 
 
-def test_report_labels_counts_a_repeated_line_once(tmp_path, monkeypatch, capsys):
+def test_report_labels_counts_a_repeated_quote_once(tmp_path, monkeypatch, capsys):
     part = [_row(0, [_issue(), _issue()]), _row(1, [_issue()])]
     _export_setup(tmp_path, monkeypatch, part)
     label = _label(_key(QUOTE), "real") | {"followups": None}
@@ -949,33 +980,91 @@ def test_held_out_system_eval_succeeds_with_no_dev_rows(tmp_path, monkeypatch, c
     assert "no dev summaries to report" in capsys.readouterr().out
 
 
-def test_dev_system_eval_fails_when_no_dev_summary_comes_back(
-    tmp_path, monkeypatch, capsys
-):
+def _dev_rerun_setup(tmp_path, monkeypatch):
+    """Video b has a judged rep0 on disk and a new rep1 to judge."""
     args = _held_out_setup(tmp_path, monkeypatch)
-    rows = [
-        {"video": "a", "type": "t", "split": "held-out"},
-        {"video": "b", "type": "t", "split": "dev"},
-    ]
+    rows = [{"video": "b", "type": "t", "split": "dev"}]
     (tmp_path / "sets" / "s.json").write_text(f.json.dumps(rows))
-    rdir = f.gen_dir("v") / "b" / "rep0"
-    rdir.mkdir(parents=True)
-    (rdir / "summary.md").write_text("s")
+    for rep in (0, 1):
+        rdir = f.gen_dir("v") / "b" / f"rep{rep}"
+        rdir.mkdir(parents=True)
+        (rdir / "summary.md").write_text("s")
     (tmp_path / "b").mkdir()
     (tmp_path / "b" / "transcript.txt").write_text("t")
     run_dir = f.system_dir("v")
     run_dir.mkdir(parents=True)
-    held = _row(0, [], video="a") | {"split": "held-out"}
-    (run_dir / "results.jsonl").write_text(f.json.dumps(held) + "\n")
+    (run_dir / "results.jsonl").write_text(f.json.dumps(_row(0, [], video="b")) + "\n")
     args.split, args.dry_run = "dev", False
     args.effort, args.timeout_s, args.workers = "medium", 1, 1
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    return args
+
+
+def _all_calls_fail(jobs, one, results_path, **kw):
+    with results_path.with_name("errors.jsonl").open("a") as out:
+        for r, rep, _ in jobs:
+            out.write(f.json.dumps({"video": r["video"], "rep": rep}) + "\n")
+
+
+def test_system_eval_fails_when_no_judge_call_comes_back(tmp_path, monkeypatch):
+    args = _dev_rerun_setup(tmp_path, monkeypatch)
     calls = []
-    # Every judge call fails: run_parallel records it in errors.jsonl.
-    monkeypatch.setattr(f, "run_parallel", lambda jobs, one, **kw: calls.extend(jobs))
-    with pytest.raises(SystemExit, match="no dev summary came back judged"):
+
+    def failed(jobs, one, results_path, **kw):
+        calls.extend((r["video"], rep) for r, rep, _ in jobs)
+        _all_calls_fail(jobs, one, results_path)
+
+    monkeypatch.setattr(f, "run_parallel", failed)
+    reports = []
+    monkeypatch.setattr(f, "cmd_system_report", lambda a: reports.append(a) or 0)
+    # rep0 from an earlier run is still on disk; this run judged nothing.
+    with pytest.raises(SystemExit, match="none of the 1 judge calls came back"):
         f.cmd_system_eval(args)
-    assert [r["video"] for r, _, _ in calls] == ["b"]
+    assert calls == [("b", 1)]
+    assert reports == []
+
+
+def test_system_eval_names_the_calls_that_did_not_come_back(
+    tmp_path, monkeypatch, capsys
+):
+    args = _dev_rerun_setup(tmp_path, monkeypatch)
+    rdir = f.gen_dir("v") / "b" / "rep2"
+    rdir.mkdir()
+    (rdir / "summary.md").write_text("s")
+
+    def half(jobs, one, results_path, **kw):
+        (_, rep, _), *rest = jobs
+        with results_path.open("a") as out:
+            out.write(f.json.dumps(_row(rep, [], video="b")) + "\n")
+        _all_calls_fail(rest, one, results_path)
+
+    monkeypatch.setattr(f, "run_parallel", half)
+    monkeypatch.setattr(f, "cmd_system_report", lambda a: 0)
+    assert f.cmd_system_eval(args) == 0
+    assert "1 of 2 judge calls not judged" in capsys.readouterr().out
+
+
+def test_dev_system_eval_fails_when_every_dev_row_is_truncated(tmp_path, monkeypatch):
+    args = _dev_rerun_setup(tmp_path, monkeypatch)
+    rows = [_row(rep, [], video="b") | {"status": "truncated"} for rep in (0, 1)]
+    results = f.system_dir("v") / "results.jsonl"
+    results.write_text("".join(f.json.dumps(r) + "\n" for r in rows))
+    # Truncated rows count as done, so this run sends nothing.
+    monkeypatch.setattr(f, "run_parallel", lambda jobs, one, **kw: None)
+    with pytest.raises(SystemExit, match=r"truncated rows \(2 for dev\)"):
+        f.cmd_system_eval(args)
+
+
+def test_held_out_system_eval_fails_when_no_judge_call_comes_back(
+    tmp_path, monkeypatch
+):
+    args = _held_out_setup(tmp_path, monkeypatch)
+    args.dry_run, args.effort, args.timeout_s, args.workers = False, "medium", 1, 1
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setattr(f, "run_parallel", _all_calls_fail)
+    with pytest.raises(SystemExit, match="judge again with --force-held-out"):
+        f.cmd_system_eval(args)
+    assert (f.system_dir("v") / f.HELD_OUT_MARKER).exists()
 
 
 @needs_arvio

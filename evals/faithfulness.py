@@ -988,11 +988,30 @@ def cmd_system_eval(args) -> int:
         workers=args.workers,
     )
     print("\nDev split only; held-out stays unread until the final comparison.")
+    # Jobs skip every (video, rep) already in results.jsonl, so an ok row for
+    # a sent job is one this run wrote.
+    sent = {(r["video"], rep) for r, rep, _ in jobs}
+    back = sum((r["video"], r["rep"]) in sent for r in ok_rows(args.variant, "all"))
+    missed = f"see {run_dir / 'errors.jsonl'} and the truncated rows in {results_path}"
+    if sent and not back:
+        again = ""
+        if any(r["split"] == "held-out" for r, _, _ in jobs):
+            again = ". This held-out run is recorded; judge again with --force-held-out"
+        sys.exit(
+            f"none of the {len(sent)} judge calls came back judged; {missed}{again}"
+        )
+    if back < len(sent):
+        print(f"{len(sent) - back} of {len(sent)} judge calls not judged; {missed}")
     if not ok_rows(args.variant, "dev"):
-        if any(r["split"] == "dev" for r, _, _ in jobs):
+        if any(r["split"] == "dev" for r, _, _ in items):
+            truncated = sum(
+                row["split"] == "dev" and row["status"] == "truncated"
+                for row in read_jsonl(results_path)
+            )
             sys.exit(
-                "no dev summary came back judged; see "
-                f"{run_dir / 'errors.jsonl'} and the truncated rows"
+                f"no dev summary has a judged result; {missed}. A rerun skips "
+                f"truncated rows ({truncated} for dev); remove them to judge "
+                "those summaries again."
             )
         print("no dev summaries to report")
         return 0
@@ -1525,14 +1544,14 @@ def cmd_label_export(args) -> int:
     part = ok_rows(args.variant, args.split)
     if not part:
         sys.exit(f"no judged summaries for {args.variant!r} in split {args.split!r}")
-    task = label_task(args.variant, args.split)
-    task.mkdir(exist_ok=True)
     # The same lock arvio's server holds on every task folder it serves, so
     # an export can't change items under a labeling session. A new folder is
     # locked too: a server that still lists a deleted one takes it back once
     # it exists. arvio needs fcntl, so this runs only where arvio can.
     import fcntl
 
+    task = label_task(args.variant, args.split)
+    task.mkdir(exist_ok=True)
     fd = os.open(task, os.O_RDONLY)
     try:
         try:
