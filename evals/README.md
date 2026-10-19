@@ -81,23 +81,31 @@ arvio
 task folder, and arvio writes your labels there. Run it again after
 `system-eval` adds results. A summary line flagged again, in another rep or
 variant, keeps its id (made from the video, the line and the quoted text), so
-you label it once: the export skips flags already labeled in another variant's
-folder. Only labels from a finished session count (Finish locks them).
+you label it once: the export leaves out flags already labeled in another
+label folder. That works only for labels that exist when you export, so
+export, label and Finish one variant before you export the next. Only labels
+from a finished session count (Finish locks them).
 
 The report then shows how many flagged lines are labeled (a line flagged in
 several summaries counts once), the judge's precision on them with a 95% CI,
 and, once every flag is labeled, real errors per summary and the share of
 summaries with no real major error. Compare variants on labeled real errors,
-and read the precision line before trusting raw counts.
+and read the precision line before trusting raw counts. A flag with an empty
+`summary_quote` has nothing to show, so it can't be labeled; while any summary
+has one, the report leaves out real errors per summary and says why. If one
+line has different answers in two label folders, the report says how many and
+uses a finished label first, then the latest.
 
 Any change to the task card, even to its title, marks the older label folders
-stale in the report until you run `label-export` for them again. After that,
-their labels count again unless the judge prompt, the labeling rules, the
-question, the choices or the follow-ups changed: the card's pin is a hash of
-the judge prompt and the rules. Labels made under an older card stay in
-`labels.jsonl` but no longer count. A known limit: `results.jsonl` rows don't
-record which judge prompt produced them, so after a judge prompt change, rows
-judged before and after it sit in one variant's results unmarked.
+stale in the report until you run `label-export` for them again. Do that
+before you export a new variant: the export can't see a stale folder's labels,
+so it would ask for those flags again. After that, their labels count again
+unless the judge prompt, the labeling rules, the question, the choices or the
+follow-ups changed: the card's pin is a hash of the judge prompt and the
+rules. Labels made under an older card stay in `labels.jsonl` but no longer
+count. A known limit: `results.jsonl` rows don't record which judge prompt
+produced them, so after a judge prompt change, rows judged before and after it
+sit in one variant's results unmarked.
 
 The variants are summarized with the same model and judged by the same judge,
 so a difference is the prompt's. Twelve dev videos is a small sample: treat a

@@ -988,7 +988,9 @@ def cmd_system_eval(args) -> int:
         workers=args.workers,
     )
     print("\nDev split only; held-out stays unread until the final comparison.")
-    return cmd_system_report(argparse.Namespace(variant=args.variant, split="dev"))
+    # The paid run worked; a label problem is printed, not turned into a failure.
+    cmd_system_report(argparse.Namespace(variant=args.variant, split="dev"))
+    return 0
 
 
 def guard_held_out(run_dir: Path, args) -> None:
@@ -1097,8 +1099,24 @@ CARD_CHANGE_NOTE = (
 )
 
 
+LABEL_SPLITS = ["dev", "held-out"]
+
+
 class LabelError(Exception):
     """Labels that couldn't be read, with the reason."""
+
+
+class ArvioMissing(LabelError):
+    """arvio isn't installed, so no labels could be read."""
+
+
+def key_norm(text: str) -> str:
+    """norm() as it was when flag ids were defined. Kept apart from norm() on
+    purpose: a change here gives every flag a new id, and its label no longer
+    matches it."""
+    text = unicodedata.normalize("NFKC", html.unescape(text))
+    text = re.sub(r"[*`]", "", text)
+    return re.sub(r"\s+", " ", text).strip().lower()
 
 
 def flag_key(video: str, line: str, quote: str) -> str:
@@ -1106,20 +1124,32 @@ def flag_key(video: str, line: str, quote: str) -> str:
     the quote ("" if no line does) and the quote. The same line flagged again,
     in another rep or variant, gets the same id, so one label covers it; the
     same short quote on two different lines gets two."""
-    text = f"{video}\0{norm(line)}\0{norm(quote)}"
+    text = f"{video}\0{key_norm(line)}\0{key_norm(quote)}"
     return "vs1-" + hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
 def quote_lines(lines: list[str], quote: str) -> list[int]:
-    """The summary lines that hold the quote, compared after norm()."""
-    want = norm(quote)
-    return [n for n, ln in enumerate(lines) if want and want in norm(ln)]
+    """The summary lines that hold the quote, compared after key_norm()."""
+    want = key_norm(quote)
+    return [n for n, ln in enumerate(lines) if want and want in key_norm(ln)]
+
+
+def marked_span(line: str, quote: str) -> str | None:
+    """The part of `line` that reads as `quote` when markdown emphasis and
+    case are ignored, with the emphasis markers around it; None if no part
+    does. The judge copies quotes but may drop their markdown."""
+    want = key_norm(quote)
+    if not want:
+        return None
+    body = r"[*`]*".join(r"\s+" if ch == " " else re.escape(ch) for ch in want)
+    m = re.search(rf"[*`]*{body}[*`]*", line, re.IGNORECASE)
+    return m.group(0) if m else None
 
 
 def issue_key(video: str, lines: list[str], quote: str) -> str | None:
     """The flag key of a quote in a summary; None for an empty quote, which
     can't be shown or labeled."""
-    if not norm(quote):
+    if not key_norm(quote):
         return None
     hits = quote_lines(lines, quote)
     return flag_key(video, lines[hits[0]] if hits else "", quote)
@@ -1263,8 +1293,7 @@ def flag_item(
     else:
         line = lines[hits[0]]
         shown = summary_section(lines, hits[0])
-        # The judge copies the quote, but may drop markdown; then mark the line.
-        mark = quote if quote in shown else line.strip()
+        mark = marked_span(line, quote) or line.strip()
         where = "" if len(hits) == 1 else f" (on {len(hits)} lines; the first shown)"
         times = [_seconds(*m.groups()) for m in TS_RE.finditer(line)]
     times += [
@@ -1285,12 +1314,13 @@ def flag_item(
         },
     ]
     for run in transcript_windows(chunks, times):
-        first, last = chunks[run[0]][1], chunks[run[-1]][1]
+        first = chunks[run[0]][1].splitlines()[0]
+        last = chunks[run[-1]][1].splitlines()[0]
         display.append(
             {
                 "kind": "text",
-                "title": f"Transcript {first.splitlines()[0]} to "
-                f"{last.splitlines()[0]}",
+                "title": f"Transcript {first}"
+                + ("" if len(run) == 1 else f" to {last}"),
                 "text": "\n\n".join(chunks[i][1] for i in run),
             }
         )
@@ -1392,7 +1422,7 @@ def read_labels(task: Path, quiet: bool = False) -> list[dict]:
             check=False,
         )
     except FileNotFoundError:
-        raise LabelError(
+        raise ArvioMissing(
             "arvio is not installed or not on PATH. Install it with:\n"
             f"  {ARVIO_INSTALL}"
         ) from None
@@ -1416,8 +1446,17 @@ def counted_labels(task: Path, items: dict[str, dict]) -> set[str]:
         try:
             rows = read_labels(copy, quiet=True)
         except LabelError as e:
-            raise LabelError(str(e).replace(str(copy), str(task))) from None
+            raise type(e)(str(e).replace(str(copy), str(task))) from None
     return {row["item_id"] for row in rows}
+
+
+def file_stamp(path: Path) -> tuple[int, int] | None:
+    """mtime and size, to notice another writer; None if there is no file."""
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return None
+    return st.st_mtime_ns, st.st_size
 
 
 def label_task(variant: str, split: str) -> Path:
@@ -1429,25 +1468,36 @@ def export_args(task: Path) -> str:
     return f"--variant {task.parent.name} --split {task.name.removeprefix('label-')}"
 
 
-def current_labels(skip: Path | None = None) -> tuple[dict[str, dict], list[Path]]:
+def current_labels(
+    skip: Path | None = None,
+) -> tuple[dict[str, dict], list[Path], set[str]]:
     """The label per flag key across every label folder made with today's
-    card, a locked one first, then the latest; and the folders whose card is
-    older."""
+    card, a locked one first, then the latest; the folders whose card is
+    older; and the keys labeled in more than one folder with different
+    answers."""
     card = label_card()
     labels: dict[str, dict] = {}
+    answers: dict[str, set[str]] = {}
     stale = []
-    for task in sorted((EVAL_DIR / "runs" / "system").glob("*/label-*")):
+    folders = sorted(
+        task
+        for split in LABEL_SPLITS
+        for task in (EVAL_DIR / "runs" / "system").glob(f"*/label-{split}")
+    )
+    for task in folders:
         if task == skip or not (task / "task.toml").exists():
             continue
-        if (task / "task.toml").read_text() != card:
+        if (task / "task.toml").read_text(encoding="utf-8") != card:
             stale.append(task)
             continue
         for row in read_labels(task):
-            have = labels.get(row["item_id"])
-            rank = (row["locked"], row["labeled_at"])
-            if have is None or rank > (have["locked"], have["labeled_at"]):
-                labels[row["item_id"]] = row
-    return labels, stale
+            key = row["item_id"]
+            answers.setdefault(key, set()).add(row["answer"])
+            have = labels.get(key)
+            rank = (row["locked"], row.get("labeled_at", ""))
+            if have is None or rank > (have["locked"], have.get("labeled_at", "")):
+                labels[key] = row
+    return labels, stale, {k for k, a in answers.items() if len(a) > 1}
 
 
 def ok_rows(variant: str, split: str) -> list[dict]:
@@ -1462,9 +1512,9 @@ def cmd_label_export(args) -> int:
         sys.exit(f"no judged summaries for {args.variant!r} in split {args.split!r}")
     task = label_task(args.variant, args.split)
     try:
-        elsewhere, stale = current_labels(skip=task)
-    except LabelError as e:
-        sys.exit(str(e))
+        elsewhere, stale, _ = current_labels(skip=task)
+    except (LabelError, OSError, ValueError) as e:
+        sys.exit(f"couldn't read the other label folders: {e}")
     for folder in stale:
         print(
             f"{folder} has an older card; label-export {export_args(folder)} updates it"
@@ -1472,9 +1522,11 @@ def cmd_label_export(args) -> int:
     if stale:
         print(CARD_CHANGE_NOTE)
     old = {item["id"]: item for item in read_jsonl(task / "items.jsonl")}
-    labeled = labeled_ids(task / "labels.jsonl")
-    items: dict[str, dict] = {}
-    flags = empty = repeats = skipped = 0
+    labels_path = task / "labels.jsonl"
+    seen = file_stamp(labels_path)
+    labeled = labeled_ids(labels_path)
+    fresh: dict[str, dict] = {}
+    flags = empty = repeats = 0
     for r in part:
         keys = row_keys(args.variant, r)
         if not keys:
@@ -1487,49 +1539,66 @@ def cmd_label_export(args) -> int:
             flags += 1
             if key is None:
                 empty += 1
-            elif key in items:
+            elif key in fresh:
                 repeats += 1
-            elif key in labeled and key in old:
-                # Written back as it was, so the label still matches what the
-                # labeler saw.
-                items[key] = old[key]
-            elif key in elsewhere:
-                skipped += 1
             else:
                 transcript = transcript or (vdir / "transcript.txt").read_text()
-                items[key] = flag_item(
+                fresh[key] = flag_item(
                     r, issue, summary_text, transcript, saved, args.variant
                 )
-    current = len(items)
-    # A labeled item whose flag is gone stays while its label counts: arvio
-    # refuses a folder where a label under today's card has no item, and an
-    # item kept for an older card's label would come back as waiting. A flag
-    # goes away only after a hand edit to results.jsonl or a change to flag_key.
-    dropped = 0
-    if gone := labeled - set(items):
-        extra = {k: old[k] for k in gone if k in old}
+    # A labeled item is written back as it was, so its label still matches
+    # what the labeler saw. A labeled item whose flag is gone stays too, while
+    # its label counts: arvio refuses a folder where a label under today's
+    # card has no item. Only arvio knows which labels still count after a card
+    # change, so it decides on a copy of the folder. A flag goes away only
+    # after a hand edit to results.jsonl or a change to flag_key.
+    trial = {k: old[k] if k in labeled and k in old else v for k, v in fresh.items()}
+    trial |= {k: old[k] for k in old if k in labeled and k not in fresh}
+    counted: set[str] = set()
+    if labeled:
         try:
-            counted = counted_labels(task, items | extra)
+            counted = counted_labels(task, trial)
+        except ArvioMissing as e:
+            sys.exit(f"{e}\nNothing was written to {task}.")
         except LabelError as e:
             sys.exit(
                 f"{e}\nNothing was written to {task}. If a label above has no "
                 "item, restore items.jsonl or move labels.jsonl aside."
             )
-        items.update((k, v) for k, v in extra.items() if k in counted)
-        dropped = len(extra) - (len(items) - current)
+    items: dict[str, dict] = {}
+    skipped = dropped = 0
+    for key, item in trial.items():
+        if key in counted:
+            items[key] = item
+        elif key not in fresh:
+            dropped += 1
+        elif key in elsewhere:
+            skipped += 1
+        else:
+            items[key] = fresh[key]
+    if file_stamp(labels_path) != seen:
+        sys.exit(
+            f"{labels_path} changed while exporting (is arvio open on it?). "
+            f"Nothing was written to {task}; run label-export again."
+        )
     task.mkdir(parents=True, exist_ok=True)
     card = task / "task.toml"
-    if card.exists() and card.read_text() != label_card():
+    if card.exists() and card.read_text(encoding="utf-8") != label_card():
         print(f"updated the card in {task}. {CARD_CHANGE_NOTE}")
     write_atomic(card, label_card())
     write_atomic(task / "items.jsonl", jsonl(items.values()))
     written = [i["id"] for i in read_jsonl(task / "items.jsonl")]
     if written != list(items):
-        sys.exit(f"read back {len(written)} items from {task}, wrote {len(items)}")
+        sys.exit(
+            f"{task / 'items.jsonl'} doesn't read back as written "
+            f"({len(items)} items written, {len(written)} read back); "
+            "run label-export again"
+        )
+    current = sum(key in fresh for key in items)
     print(
         f"{flags} judge flags in {len(part)} summaries -> {current} items "
         f"({repeats} repeats of a flagged line, {skipped} already labeled "
-        f"in another variant) -> {task}"
+        f"in another label folder) -> {task}"
     )
     if empty:
         print(f"left out {empty} flags with an empty summary_quote: nothing to show")
@@ -1556,7 +1625,7 @@ def report_labels(part: list[dict], variant: str, split: str) -> None:
     print("labels (arvio):")
     empty = keys.count(None)
     lines = list(dict.fromkeys(k for k in keys if k is not None))
-    labels, stale = current_labels()
+    labels, stale, mixed = current_labels()
     for task in stale:
         print(f"  {task} has an older card; run label-export {export_args(task)}")
     done = {k: v for k, v in labels.items() if v["locked"]}
@@ -1580,9 +1649,15 @@ def report_labels(part: list[dict], variant: str, split: str) -> None:
             f"  {unfinished} more labeled in an arvio session not finished yet; "
             "they count after Finish"
         )
-    splits = "dev" if split == "all" else split
-    if not label_task(variant, splits).exists():
-        print(f"  label them: label-export --variant {variant} --split {splits}")
+    if differ := sum(k in mixed for k in lines):
+        print(
+            f"  {differ} flagged lines have different answers in two label "
+            "folders; the report uses a finished label first, then the latest"
+        )
+    flagged = {r["split"] for r, ks in zip(part, per_row, strict=True) if any(ks)}
+    for s in sorted(flagged):
+        if not label_task(variant, s).exists():
+            print(f"  label them: label-export --variant {variant} --split {s}")
     if real + false:
         lo, hi = wilson(real, real + false)
         print(
@@ -1590,25 +1665,34 @@ def report_labels(part: list[dict], variant: str, split: str) -> None:
             f"(95% CI {lo:.2f}-{hi:.2f}; can't tell left out; lines from one "
             "video are not independent)"
         )
-    if None not in answers and not empty:
-        per = []
-        clean = 0
-        for ks in per_row:
-            got = [done[k] for k in ks]
-            per.append(sum(g["answer"] == "real" for g in got))
-            clean += not any(
-                g["answer"] == "real" and g["followups"].get("severity") == "major"
-                for g in got
-            )
-        m, sd = mean_sd([float(x) for x in per])
-        lo, hi = wilson(clean, len(part))
+    if None in answers:
+        return
+    if empty:
         print(
-            f"  real errors per summary: mean {m:.2f} (sd {sd:.2f}); "
-            f"summaries with no real major error: {clean}/{len(part)} "
-            f"(95% CI {lo:.2f}-{hi:.2f}; two reps of one video are not "
-            "independent; counts only errors the judge flagged"
-            + (", can't tell counted as no error)" if unsure else ")")
+            "  real errors per summary not shown: the flags with an empty "
+            "summary_quote have no label, so the count would be short"
         )
+        return
+    per = []
+    clean = 0
+    for ks in per_row:
+        got = [done[k] for k in dict.fromkeys(ks)]
+        per.append(sum(g["answer"] == "real" for g in got))
+        clean += not any(
+            g["answer"] == "real"
+            and (g.get("followups") or {}).get("severity") == "major"
+            for g in got
+        )
+    m, sd = mean_sd([float(x) for x in per])
+    lo, hi = wilson(clean, len(part))
+    print(
+        f"  real errors per summary: mean {m:.2f} (sd {sd:.2f}; a line flagged "
+        "twice in one summary counts once); "
+        f"summaries with no real major error: {clean}/{len(part)} "
+        f"(95% CI {lo:.2f}-{hi:.2f}; two reps of one video are not "
+        "independent; counts only errors the judge flagged"
+        + (", can't tell counted as no error)" if unsure else ")")
+    )
 
 
 def mean_sd(xs: list[float]) -> tuple[float, float]:
@@ -1779,7 +1863,7 @@ def main() -> int:
         "label-export", help="write a system run's judge flags for arvio (free)"
     )
     le.add_argument("--variant", default="baseline", help="name for this prompt")
-    le.add_argument("--split", default="dev", choices=["dev", "held-out"])
+    le.add_argument("--split", default="dev", choices=LABEL_SPLITS)
     le.set_defaults(func=cmd_label_export)
 
     args = ap.parse_args()
