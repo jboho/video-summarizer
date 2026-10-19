@@ -1,6 +1,7 @@
 import importlib.util
 import os
 import shutil
+import sys
 import tomllib
 
 import faithfulness as f
@@ -641,9 +642,9 @@ def test_label_export_locks_a_folder_it_creates(tmp_path, monkeypatch):
     assert not task.exists()
     held = []
 
-    def export(args, folder, part):
-        import fcntl
+    fcntl = pytest.importorskip("fcntl")
 
+    def export(args, folder, part):
         fd = os.open(folder, os.O_RDONLY)
         try:
             with pytest.raises(BlockingIOError):
@@ -656,6 +657,14 @@ def test_label_export_locks_a_folder_it_creates(tmp_path, monkeypatch):
     monkeypatch.setattr(f, "export_labels", export)
     assert f.cmd_label_export(args) == 0
     assert held == [task]
+
+
+def test_label_export_without_fcntl_leaves_no_folder(tmp_path, monkeypatch):
+    args = _export_setup(tmp_path, monkeypatch, [_row(0, [_issue()])])
+    monkeypatch.setitem(sys.modules, "fcntl", None)
+    with pytest.raises(ImportError):
+        f.cmd_label_export(args)
+    assert not f.label_task("base", "dev").exists()
 
 
 def test_label_export_of_an_unknown_variant_leaves_no_folder(tmp_path, monkeypatch):
@@ -1006,7 +1015,7 @@ def _all_calls_fail(jobs, one, results_path, **kw):
             out.write(f.json.dumps({"video": r["video"], "rep": rep}) + "\n")
 
 
-def test_system_eval_fails_when_no_judge_call_comes_back(tmp_path, monkeypatch):
+def test_system_eval_fails_when_no_judge_call_comes_back(tmp_path, monkeypatch, capsys):
     args = _dev_rerun_setup(tmp_path, monkeypatch)
     calls = []
 
@@ -1018,10 +1027,14 @@ def test_system_eval_fails_when_no_judge_call_comes_back(tmp_path, monkeypatch):
     reports = []
     monkeypatch.setattr(f, "cmd_system_report", lambda a: reports.append(a) or 0)
     # rep0 from an earlier run is still on disk; this run judged nothing.
-    with pytest.raises(SystemExit, match="none of the 1 judge calls came back"):
+    with pytest.raises(SystemExit, match="no dev judge call came back judged") as e:
         f.cmd_system_eval(args)
+    assert "Dev results" not in str(e.value)
     assert calls == [("b", 1)]
     assert reports == []
+    out = capsys.readouterr().out
+    assert "dev: 0 of 1 judge calls came back judged (1 failed, see " in out
+    assert "To judge the rest, rerun with --split dev." in out
 
 
 def test_system_eval_names_the_calls_that_did_not_come_back(
@@ -1041,7 +1054,9 @@ def test_system_eval_names_the_calls_that_did_not_come_back(
     monkeypatch.setattr(f, "run_parallel", half)
     monkeypatch.setattr(f, "cmd_system_report", lambda a: 0)
     assert f.cmd_system_eval(args) == 0
-    assert "1 of 2 judge calls not judged" in capsys.readouterr().out
+    assert (
+        "dev: 1 of 2 judge calls came back judged (1 failed" in capsys.readouterr().out
+    )
 
 
 def test_dev_system_eval_fails_when_every_dev_row_is_truncated(tmp_path, monkeypatch):
@@ -1051,20 +1066,128 @@ def test_dev_system_eval_fails_when_every_dev_row_is_truncated(tmp_path, monkeyp
     results.write_text("".join(f.json.dumps(r) + "\n" for r in rows))
     # Truncated rows count as done, so this run sends nothing.
     monkeypatch.setattr(f, "run_parallel", lambda jobs, one, **kw: None)
-    with pytest.raises(SystemExit, match=r"truncated rows \(2 for dev\)"):
+    with pytest.raises(SystemExit, match="2 are truncated, and a rerun skips them"):
         f.cmd_system_eval(args)
 
 
+def test_system_eval_names_a_call_truncated_in_this_run(tmp_path, monkeypatch, capsys):
+    args = _dev_rerun_setup(tmp_path, monkeypatch)
+
+    def truncated(jobs, one, results_path, **kw):
+        with results_path.open("a") as out:
+            row = _row(1, [], video="b") | {"status": "truncated"}
+            out.write(f.json.dumps(row) + "\n")
+
+    monkeypatch.setattr(f, "run_parallel", truncated)
+    with pytest.raises(SystemExit, match="no dev judge call came back judged"):
+        f.cmd_system_eval(args)
+    out = capsys.readouterr().out
+    assert "dev: 0 of 1 judge calls came back judged (1 truncated" in out
+    assert "failed" not in out
+    assert "remove the truncated rows (a rerun skips them), then rerun" in out
+
+
+def _all_split_setup(tmp_path, monkeypatch):
+    """Held-out video a and dev video b, one summary each, nothing judged."""
+    args = _held_out_setup(tmp_path, monkeypatch)
+    rows = [
+        {"video": "a", "type": "t", "split": "held-out"},
+        {"video": "b", "type": "t", "split": "dev"},
+    ]
+    (tmp_path / "sets" / "s.json").write_text(f.json.dumps(rows))
+    rdir = f.gen_dir("v") / "b" / "rep0"
+    rdir.mkdir(parents=True)
+    (rdir / "summary.md").write_text("s")
+    (tmp_path / "b").mkdir()
+    (tmp_path / "b" / "transcript.txt").write_text("t")
+    args.split, args.dry_run = "all", False
+    args.effort, args.timeout_s, args.workers = "medium", 1, 1
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    return args
+
+
+def _judge_only(split: str):
+    def run(jobs, one, results_path, **kw):
+        ok = [(r, rep) for r, rep, _ in jobs if r["split"] == split]
+        with results_path.open("a") as out:
+            for r, rep in ok:
+                row = _row(rep, [], video=r["video"]) | {"split": r["split"]}
+                out.write(f.json.dumps(row) + "\n")
+        _all_calls_fail([j for j in jobs if j[0]["split"] != split], one, results_path)
+
+    return run
+
+
+def test_system_eval_fails_when_only_held_out_comes_back_empty(
+    tmp_path, monkeypatch, capsys
+):
+    args = _all_split_setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(f, "run_parallel", _judge_only("dev"))
+    reports = []
+    monkeypatch.setattr(f, "cmd_system_report", lambda a: reports.append(a) or 0)
+    with pytest.raises(
+        SystemExit,
+        match="no held-out judge call came back judged; see above. Dev results: "
+        "system-report --variant v --split dev",
+    ):
+        f.cmd_system_eval(args)
+    assert reports == []
+    out = capsys.readouterr().out
+    assert "held-out: 0 of 1 judge calls came back judged (1 failed" in out
+    assert "--split held-out --force-held-out." in out
+    assert "dev:" not in out
+
+
+def test_system_eval_names_held_out_calls_that_did_not_come_back(
+    tmp_path, monkeypatch, capsys
+):
+    args = _all_split_setup(tmp_path, monkeypatch)
+    rdir = f.gen_dir("v") / "a" / "rep1"
+    rdir.mkdir()
+    (rdir / "summary.md").write_text("s")
+
+    def half(jobs, one, results_path, **kw):
+        # Every rep0 comes back; held-out a's rep1 fails.
+        with results_path.open("a") as out:
+            for r, rep, _ in jobs:
+                if rep == 0:
+                    row = _row(0, [], video=r["video"]) | {"split": r["split"]}
+                    out.write(f.json.dumps(row) + "\n")
+        _all_calls_fail([j for j in jobs if j[1] != 0], one, results_path)
+
+    monkeypatch.setattr(f, "run_parallel", half)
+    reports = []
+    monkeypatch.setattr(f, "cmd_system_report", lambda a: reports.append(a) or 0)
+    assert f.cmd_system_eval(args) == 0
+    assert [(a.variant, a.split) for a in reports] == [("v", "dev")]
+    out = capsys.readouterr().out
+    assert "held-out: 1 of 2 judge calls came back judged (1 failed" in out
+    assert "--split held-out --force-held-out." in out
+
+
+def test_load_set_refuses_a_video_listed_twice(tmp_path, monkeypatch):
+    monkeypatch.setattr(f, "EVAL_DIR", tmp_path)
+    (tmp_path / "sets").mkdir()
+    rows = [
+        {"video": "a", "type": "t", "split": "dev"},
+        {"video": "a", "type": "t", "split": "held-out"},
+    ]
+    (tmp_path / "sets" / "s.json").write_text(f.json.dumps(rows))
+    with pytest.raises(SystemExit, match="lists a more than once"):
+        f.load_set("s", "dev")
+
+
 def test_held_out_system_eval_fails_when_no_judge_call_comes_back(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, capsys
 ):
     args = _held_out_setup(tmp_path, monkeypatch)
     args.dry_run, args.effort, args.timeout_s, args.workers = False, "medium", 1, 1
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     monkeypatch.setattr(f, "run_parallel", _all_calls_fail)
-    with pytest.raises(SystemExit, match="judge again with --force-held-out"):
+    with pytest.raises(SystemExit, match="no held-out judge call came back judged"):
         f.cmd_system_eval(args)
     assert (f.system_dir("v") / f.HELD_OUT_MARKER).exists()
+    assert "--split held-out --force-held-out." in capsys.readouterr().out
 
 
 @needs_arvio

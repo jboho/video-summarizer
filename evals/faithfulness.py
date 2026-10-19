@@ -727,6 +727,9 @@ HELD_OUT_MARKER = "held-out-runs.json"
 
 def load_set(name: str, split: str) -> list[dict]:
     rows = json.loads((EVAL_DIR / "sets" / f"{name}.json").read_text())
+    videos = [r["video"] for r in rows]
+    if twice := sorted({v for v in videos if videos.count(v) > 1}):
+        sys.exit(f"set {name!r} lists {', '.join(twice)} more than once")
     if split != "all":
         rows = [r for r in rows if r["split"] == split]
     if not rows:
@@ -988,36 +991,75 @@ def cmd_system_eval(args) -> int:
         workers=args.workers,
     )
     print("\nDev split only; held-out stays unread until the final comparison.")
-    # Jobs skip every (video, rep) already in results.jsonl, so an ok row for
-    # a sent job is one this run wrote.
-    sent = {(r["video"], rep) for r, rep, _ in jobs}
-    back = sum((r["video"], r["rep"]) in sent for r in ok_rows(args.variant, "all"))
-    missed = f"see {run_dir / 'errors.jsonl'} and the truncated rows in {results_path}"
-    if sent and not back:
-        again = ""
-        if any(r["split"] == "held-out" for r, _, _ in jobs):
-            again = ". This held-out run is recorded; judge again with --force-held-out"
+    lines, none_back = unjudged(jobs, results_path)
+    for line in lines:
+        print(line)
+    if none_back:
+        dev = ""
+        if "dev" not in none_back and ok_rows(args.variant, "dev"):
+            dev = f". Dev results: system-report --variant {args.variant} --split dev"
         sys.exit(
-            f"none of the {len(sent)} judge calls came back judged; {missed}{again}"
+            f"no {' or '.join(none_back)} judge call came back judged; see above{dev}"
         )
-    if back < len(sent):
-        print(f"{len(sent) - back} of {len(sent)} judge calls not judged; {missed}")
     if not ok_rows(args.variant, "dev"):
         if any(r["split"] == "dev" for r, _, _ in items):
+            # No dev call was sent, so every dev summary has a row, none ok.
             truncated = sum(
                 row["split"] == "dev" and row["status"] == "truncated"
                 for row in read_jsonl(results_path)
             )
             sys.exit(
-                f"no dev summary has a judged result; {missed}. A rerun skips "
-                f"truncated rows ({truncated} for dev); remove them to judge "
-                "those summaries again."
+                f"no dev summary has a judged result in {results_path}"
+                + (
+                    f"; {truncated} are truncated, and a rerun skips them: "
+                    "remove those rows to judge them again"
+                    if truncated
+                    else ""
+                )
             )
         print("no dev summaries to report")
         return 0
     # The paid run worked, so a label problem is printed, not a failure.
     cmd_system_report(argparse.Namespace(variant=args.variant, split="dev"))
     return 0
+
+
+def unjudged(jobs, results_path: Path) -> tuple[list[str], list[str]]:
+    """One line per split whose judge calls in this run didn't all come back
+    judged, and the splits where none did."""
+    # Jobs skip every (video, rep) already in results.jsonl, so a row for a
+    # sent pair is one this run wrote.
+    sent: dict[str, set[tuple[str, int]]] = {}
+    for r, rep, _ in jobs:
+        sent.setdefault(r["split"], set()).add((r["video"], rep))
+    status = {(r["video"], r["rep"]): r["status"] for r in read_jsonl(results_path)}
+    lines, none_back = [], []
+    for split, pairs in sorted(sent.items()):
+        judged = sum(status.get(p) == "ok" for p in pairs)
+        if judged == len(pairs):
+            continue
+        if not judged:
+            none_back.append(split)
+        truncated = sum(status.get(p) == "truncated" for p in pairs)
+        failed = len(pairs) - judged - truncated
+        why = []
+        if failed:
+            why.append(f"{failed} failed, see {results_path.with_name('errors.jsonl')}")
+        if truncated:
+            why.append(f'{truncated} truncated, status "truncated" in {results_path}')
+        rerun = (
+            "rerun with --split dev"
+            if split == "dev"
+            else "this held-out run is recorded, so rerun with --split held-out "
+            "--force-held-out"
+        )
+        if truncated:
+            rerun = "remove the truncated rows (a rerun skips them), then " + rerun
+        lines.append(
+            f"{split}: {judged} of {len(pairs)} judge calls came back judged "
+            f"({'; '.join(why)}). To judge the rest, {rerun}."
+        )
+    return lines, none_back
 
 
 def guard_held_out(run_dir: Path, args) -> None:
