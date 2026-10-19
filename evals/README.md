@@ -8,7 +8,7 @@ command lists its flags. The data lives outside this repo:
 VIDEO_SUMMARY_DIR=~/Code/video-summaries     # transcripts, one folder per video
 $VIDEO_SUMMARY_DIR/_eval/sets/phase2.json    # 20 videos: 12 dev, 8 held-out
 $VIDEO_SUMMARY_DIR/_eval/runs/gen/VARIANT/   # summaries made by regen
-$VIDEO_SUMMARY_DIR/_eval/runs/system/VARIANT/  # judge results, labels files
+$VIDEO_SUMMARY_DIR/_eval/runs/system/VARIANT/  # judge results, label tasks
 ```
 
 Set `VIDEO_SUMMARY_DIR` first; the default is `~/Documents/video-summaries`.
@@ -61,14 +61,35 @@ The report gives judge flags per summary and per 100 claims, the share of
 summaries with no major flag (with a 95% CI), a breakdown by category and
 video type, the rep0-vs-rep1 gap, and the deterministic check errors.
 
-**Dev scoring needs labels.** A judge flag is only a candidate error. Each
-report writes `runs/system/VARIANT/labels-dev.json` with one entry per flag;
-set `verdict` to `"real"` or `"false_alarm"` (and add a `note` if useful).
-Re-running the report keeps verdicts already filled in. Until the flags are
-labeled, flag counts mix real errors with judge mistakes, so a drop in flags
-can mean the prompt got better or the judge got quieter. Compare variants on
-labeled real errors, and read the judge precision line before trusting raw
-counts. The baseline's file is `runs/system/baseline/labels-dev.json`.
+**Dev scoring needs labels.** A judge flag is only a candidate error. Until
+the flags are labeled, flag counts mix real errors with judge mistakes, so a
+drop in flags can mean the prompt got better or the judge got quieter. Label
+them in [arvio](https://github.com/jboho/arvio), a small local labeling page.
+It shows one flag at a time with the rules, the summary section and the
+transcript around the cited times, and keeps the judge's answer hidden until
+you finish a session.
+
+```
+uv tool install git+https://github.com/jboho/arvio@v0.1.0   # once
+uv run evals/faithfulness.py label-export --variant grounded-v1
+arvio add $VIDEO_SUMMARY_DIR/_eval/runs/system/grounded-v1/label-dev  # once
+arvio
+```
+
+`label-export` writes the flags into `runs/system/VARIANT/label-dev/`, an arvio
+task folder, and arvio writes your labels there. Run it again after
+`system-eval` adds results. A sentence flagged again, in another rep or
+variant, keeps its id, so you label it once: the export skips flags already
+labeled in another variant's folder. Only labels from a finished session count
+(Finish locks them).
+
+The report then shows how many flags are labeled, the judge's precision on them
+with a 95% CI, and, once every flag is labeled, real errors per summary and the
+share of summaries with no real major error. Compare variants on labeled real
+errors, and read the precision line before trusting raw counts. The task card
+carries a hash of the judge prompt: after a judge prompt change, labels made
+under the old card stop counting, and the report says which folders to export
+again.
 
 The variants are summarized with the same model and judged by the same judge,
 so a difference is the prompt's. Twelve dev videos is a small sample: treat a
@@ -94,7 +115,8 @@ uv run evals/faithfulness.py system-report --variant baseline --split held-out
 `runs/system/VARIANT/held-out-runs.json` and refuses a second held-out run of
 the same variant (`--split held-out` or `--split all`). `--force-held-out`
 overrides that, and the forced run is recorded too. Re-printing the report is
-free and allowed. Label `labels-held-out.json` the same way before comparing.
+free and allowed. Label the held-out flags the same way (`label-export --split
+held-out`) before comparing.
 If the held-out result disagrees with dev, report that; don't go back to step 1
 and tune against held-out.
 
