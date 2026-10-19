@@ -65,9 +65,10 @@ video type, the rep0-vs-rep1 gap, and the deterministic check errors.
 the flags are labeled, flag counts mix real errors with judge mistakes, so a
 drop in flags can mean the prompt got better or the judge got quieter. Label
 them in [arvio](https://github.com/jboho/arvio), a small local labeling page.
-It shows one flag at a time with the rules, the summary section and the
-transcript around the cited times, and keeps the judge's answer hidden until
-you finish a session.
+It shows one flag at a time with the rules, the summary section, and the
+transcript a minute either side of the times the summary cites and of the time
+the judge pointed to. It keeps the judge's answer hidden until you finish a
+session.
 
 ```
 uv tool install git+https://github.com/jboho/arvio@v0.1.0   # once
@@ -78,18 +79,25 @@ arvio
 
 `label-export` writes the flags into `runs/system/VARIANT/label-dev/`, an arvio
 task folder, and arvio writes your labels there. Run it again after
-`system-eval` adds results. A sentence flagged again, in another rep or
-variant, keeps its id, so you label it once: the export skips flags already
-labeled in another variant's folder. Only labels from a finished session count
-(Finish locks them).
+`system-eval` adds results. A summary line flagged again, in another rep or
+variant, keeps its id (made from the video, the line and the quoted text), so
+you label it once: the export skips flags already labeled in another variant's
+folder. Only labels from a finished session count (Finish locks them).
 
-The report then shows how many flags are labeled, the judge's precision on them
-with a 95% CI, and, once every flag is labeled, real errors per summary and the
-share of summaries with no real major error. Compare variants on labeled real
-errors, and read the precision line before trusting raw counts. The task card
-carries a hash of the judge prompt: after a judge prompt change, labels made
-under the old card stop counting, and the report says which folders to export
-again.
+The report then shows how many flagged lines are labeled (a line flagged in
+several summaries counts once), the judge's precision on them with a 95% CI,
+and, once every flag is labeled, real errors per summary and the share of
+summaries with no real major error. Compare variants on labeled real errors,
+and read the precision line before trusting raw counts.
+
+Any change to the task card, even to its title, marks the older label folders
+stale in the report until you run `label-export` for them again. After that,
+their labels count again unless the judge prompt, the labeling rules, the
+question, the choices or the follow-ups changed: the card's pin is a hash of
+the judge prompt and the rules. Labels made under an older card stay in
+`labels.jsonl` but no longer count. A known limit: `results.jsonl` rows don't
+record which judge prompt produced them, so after a judge prompt change, rows
+judged before and after it sit in one variant's results unmarked.
 
 The variants are summarized with the same model and judged by the same judge,
 so a difference is the prompt's. Twelve dev videos is a small sample: treat a

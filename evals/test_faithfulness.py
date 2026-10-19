@@ -1,3 +1,4 @@
+import shutil
 import tomllib
 
 import faithfulness as f
@@ -217,50 +218,101 @@ def _row(rep: int, issues: list[dict], video: str = "2026-01-01_x") -> dict:
         "type": "how-to",
         "split": "dev",
         "status": "ok",
+        "model": "claude-opus-5-5",
+        "usage": dict.fromkeys(
+            [
+                "input_tokens",
+                "output_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+            ],
+            0,
+        ),
+        "claims_checked": 10,
+        "checks": {"errors": [], "advisory": 0},
         "issues": issues,
     }
 
 
-def test_flag_key_ignores_rep_markdown_and_case():
-    key = f.flag_key("2026-01-01_x", "**Start** low")
-    assert key == f.flag_key("2026-01-01_x", "start  LOW")
-    assert key != f.flag_key("2026-01-02_y", "start low")
-    assert key.startswith("vs1-") and len(key) == 20
+def _key(quote: str, summary: str = SUMMARY, video: str = "2026-01-01_x") -> str:
+    return f.issue_key(video, summary.splitlines(), quote)
 
 
-def test_label_card_parses_and_follows_the_judge_prompt():
+def test_flag_key_matches_reps_and_keeps_lines_apart():
+    line = "- Point [00:00:32]."
+    assert (
+        f.flag_key("2026-01-01_x", line, "Point [00:00:32].") == "vs1-8a00801493cbbfae"
+    )
+    key = f.flag_key("2026-01-01_x", "1. **Start** low", "**Start** low")
+    assert key == f.flag_key("2026-01-01_x", "1. start  LOW", "start  LOW")
+    assert key != f.flag_key("2026-01-02_y", "1. start low", "start low")
+    assert f.flag_key("v", "a [00:00:32]", "[00:00:32]") != f.flag_key(
+        "v", "b [00:00:32]", "[00:00:32]"
+    )
+    assert _key("") is None and _key("  ") is None
+    assert _key("Not in it.") == f.flag_key("2026-01-01_x", "", "Not in it.")
+
+
+def test_label_rules_copy_the_judge_wording():
+    rules = " ".join(f.LABEL_RULES)
+    names = []
+    for line in f.JUDGE_INSTRUCTIONS.splitlines():
+        if line.startswith("- "):
+            name, _, meaning = line[2:].partition(": ")
+            names.append(name)
+            assert f"{name.replace('_', ' ')} ({meaning.rstrip('.')})" in rules
+        elif line.startswith("Not errors:"):
+            assert line in rules
+    issue = f.ISSUE_SCHEMA["properties"]["issues"]["items"]["properties"]
+    assert names == issue["category"]["enum"]
+
+
+def test_label_card_parses_and_pins_the_prompt_and_rules(monkeypatch):
     card = tomllib.loads(f.label_card())
     assert [c["key"] for c in card["choices"]] == ["real", "false_alarm", "cant_tell"]
     hotkeys = [c["hotkey"] for c in card["choices"]] + [
         o["hotkey"] for o in card["followups"][0]["options"]
     ]
     assert len(set(hotkeys)) == len(hotkeys) and "n" not in hotkeys
-    assert card["pin"] == f.judge_pin()
-    rules = " ".join(card["rules"])
+    assert card["rules"] == f.LABEL_RULES
     issue = f.ISSUE_SCHEMA["properties"]["issues"]["items"]["properties"]
-    for category in issue["category"]["enum"]:
-        assert category.replace("_", " ") in rules
     assert [o["key"] for o in card["followups"][0]["options"]] == issue["severity"][
         "enum"
     ]
+    pin = f.label_pin()
+    assert card["pin"] == pin
+    monkeypatch.setattr(f, "LABEL_RULES", [*f.LABEL_RULES, "One more rule."])
+    assert f.label_pin() != pin
+    monkeypatch.setattr(f, "JUDGE_INSTRUCTIONS", f.JUDGE_INSTRUCTIONS + "x")
+    assert f.label_pin() != pin
+    monkeypatch.setattr(f, "LABEL_RULES", ["Emoji \U0001f600 rule."])
+    assert tomllib.loads(f.label_card())["rules"] == ["Emoji \U0001f600 rule."]
 
 
 def test_transcript_windows_merge_neighbours_and_split_far_ones():
     text = "".join(
         f"[00:{m:02d}:{s:02d}]\npart {i}\n\n"
-        for i, (m, s) in enumerate([(0, 0), (0, 30), (3, 20), (3, 50), (6, 40)])
+        for i, (m, s) in enumerate([(0, 10), (0, 30), (3, 20), (3, 50), (6, 40)])
     )
     chunks = f.transcript_chunks(text)
-    assert [start for start, _ in chunks] == [0, 30, 200, 230, 400]
+    assert [start for start, _ in chunks] == [10, 30, 200, 230, 400]
     assert chunks[1][1] == "[00:00:30]\npart 1"
     assert f.transcript_windows(chunks, [30, 400]) == [[0, 1], [3, 4]]
     assert f.transcript_windows(chunks, []) == []
+    assert f.transcript_windows(chunks, [0]) == [[0, 1]]
+    assert f.transcript_windows(chunks, [9000]) == [[4]]
+    assert f.transcript_windows(f.transcript_chunks("no markers\n"), [30]) == []
 
 
 def test_flag_item_shows_the_section_and_hides_the_judge():
     saved = {"title": "T", "duration": "00:01:00"}
-    item = f.flag_item(_row(0, []), _issue(), SUMMARY, TRANSCRIPT, saved, "base")
+    secret = _issue(
+        explanation="SENTINEL-EXPLANATION", transcript_quote="SENTINEL-TQUOTE"
+    )
+    item = f.flag_item(_row(0, []), secret, SUMMARY, TRANSCRIPT, saved, "base")
+    assert item["id"] == _key(QUOTE)
     shown = item["display"][1]
+    assert shown["title"] == "Flagged in the summary"
     assert shown["text"].startswith("## Actionable summary")
     assert shown["text"].endswith("~2.5 minutes [00:00:32].")
     assert shown["highlight"] == [QUOTE]
@@ -269,7 +321,8 @@ def test_flag_item_shows_the_section_and_hides_the_judge():
     assert "45 seconds" in window["text"]
     assert [b.get("collapsed") for b in item["display"][3:]] == [True, True]
     assert item["judge"]["verdict"] == "error"
-    assert "explanation" not in str(item["display"])
+    display = f.json.dumps(item["display"])
+    assert "SENTINEL" not in display and "how-to" not in display
 
     loose = f.flag_item(
         _row(0, []), _issue("start LOW on the layers"), SUMMARY, TRANSCRIPT, saved, "b"
@@ -282,6 +335,56 @@ def test_flag_item_shows_the_section_and_hides_the_judge():
     )
     assert gone["display"][1]["text"] == "Not in it."
     assert gone["display"][1]["title"].endswith("(not found in it word for word)")
+    twice = f.flag_item(
+        _row(0, []), _issue("[00:00:32]"), SUMMARY, TRANSCRIPT, saved, "b"
+    )
+    assert twice["display"][1]["title"].endswith("(on 2 lines; the first shown)")
+
+
+def test_flag_item_windows_follow_the_judge_time():
+    transcript = "".join(f"[00:{m:02d}:00]\npart {m}\n\n" for m in range(0, 20, 2))
+    saved = {"title": "T", "duration": "00:20:00"}
+
+    def titles(quote: str, ts: str) -> list[str]:
+        item = f.flag_item(
+            _row(0, []),
+            _issue(quote, transcript_ts=ts),
+            SUMMARY,
+            transcript,
+            saved,
+            "b",
+        )
+        return [b["title"] for b in item["display"][2:-2]]
+
+    assert titles("Short.", "") == []
+    assert titles("Short.", "[00:10:00]") == ["Transcript [00:08:00] to [00:10:00]"]
+    assert titles("Short.", "00:04:00-00:16:00") == [
+        "Transcript [00:02:00] to [00:04:00]",
+        "Transcript [00:14:00] to [00:16:00]",
+    ]
+    assert titles("Point [00:00:32].", "00:16:00") == [
+        "Transcript [00:00:00] to [00:00:00]",
+        "Transcript [00:14:00] to [00:16:00]",
+    ]
+
+
+def test_every_highlight_is_an_exact_part_of_its_block():
+    saved = {"title": "T", "duration": "00:01:00"}
+    quotes = [
+        QUOTE,
+        "start LOW on the layers",
+        "Start low on the layers [00:00:02].\n2. Sonnet took",
+        "  Point [00:00:32].  ",
+        "Not in it.",
+        "[00:00:32]",
+        "Short",
+        "**Short.**",
+    ]
+    for quote in quotes:
+        item = f.flag_item(_row(0, []), _issue(quote), SUMMARY, TRANSCRIPT, saved, "b")
+        for block in item["display"]:
+            for h in block.get("highlight", []):
+                assert h and h in block["text"], quote
 
 
 def _export_setup(tmp_path, monkeypatch, rows: list[dict], variant: str = "base"):
@@ -302,9 +405,7 @@ def _export_setup(tmp_path, monkeypatch, rows: list[dict], variant: str = "base"
     return f.argparse.Namespace(variant=variant, split="dev")
 
 
-def test_label_export_writes_one_item_per_flagged_sentence(
-    tmp_path, monkeypatch, capsys
-):
+def test_label_export_writes_one_item_per_flagged_line(tmp_path, monkeypatch, capsys):
     other = _issue("Point [00:00:32].", transcript_ts="[00:00:32]")
     rows = [_row(0, [_issue(), other]), _row(1, [_issue()]), _row(2, [])]
     args = _export_setup(tmp_path, monkeypatch, rows)
@@ -313,12 +414,34 @@ def test_label_export_writes_one_item_per_flagged_sentence(
     assert (task / "task.toml").read_text() == f.label_card()
     first = (task / "items.jsonl").read_bytes()
     ids = [i["id"] for i in f.read_jsonl(task / "items.jsonl")]
-    assert ids == [f.flag_key("2026-01-01_x", q) for q in (QUOTE, "Point [00:00:32].")]
+    assert ids == [_key(QUOTE), _key("Point [00:00:32].")]
     assert (
         "3 judge flags in 3 summaries -> 2 items (1 repeats" in capsys.readouterr().out
     )
     f.cmd_label_export(args)
     assert (task / "items.jsonl").read_bytes() == first
+    assert {p.name for p in task.iterdir()} == {"items.jsonl", "task.toml"}
+
+
+def test_label_export_keeps_a_quote_on_two_lines_apart(tmp_path, monkeypatch, capsys):
+    rows = [_row(0, [_issue("[00:00:32]")]), _row(1, [_issue("[00:00:32]")])]
+    args = _export_setup(tmp_path, monkeypatch, rows)
+    moved = SUMMARY.replace("~2.5 minutes [00:00:32]", "~2.5 minutes [00:00:40]")
+    (f.gen_dir("base") / "2026-01-01_x" / "rep1" / "summary.md").write_text(moved)
+    f.cmd_label_export(args)
+    ids = [i["id"] for i in f.read_jsonl(f.label_task("base", "dev") / "items.jsonl")]
+    assert ids == [_key("[00:00:32]"), _key("[00:00:32]", moved)]
+    assert ids[0] != ids[1]
+
+
+def test_label_export_leaves_out_empty_quotes(tmp_path, monkeypatch, capsys):
+    rows = [_row(0, [_issue(""), _issue("   "), _issue()])]
+    f.cmd_label_export(_export_setup(tmp_path, monkeypatch, rows))
+    out = capsys.readouterr().out
+    assert "-> 1 items" in out
+    assert "left out 2 flags with an empty summary_quote" in out
+    items = f.read_jsonl(f.label_task("base", "dev") / "items.jsonl")
+    assert [i["id"] for i in items] == [_key(QUOTE)]
 
 
 def test_label_export_keeps_labeled_items_and_skips_labels_elsewhere(
@@ -329,8 +452,10 @@ def test_label_export_keeps_labeled_items_and_skips_labels_elsewhere(
     f.cmd_label_export(args)
     task = f.label_task("base", "dev")
     items = f.read_jsonl(task / "items.jsonl")
-    items[0]["display"] = [{"kind": "text", "text": "as the labeler saw it"}]
-    (task / "items.jsonl").write_text("".join(f.json.dumps(i) + "\n" for i in items))
+    items[0]["display"] = [{"kind": "text", "text": "as the labeler saw it "}]
+    (task / "items.jsonl").write_text(
+        "".join(f.json.dumps(i, ensure_ascii=False) + "\n" for i in items)
+    )
     (task / "labels.jsonl").write_text(
         f.json.dumps({"kind": "label", "item_id": items[0]["id"]}) + "\n{torn"
     )
@@ -339,7 +464,7 @@ def test_label_export_keeps_labeled_items_and_skips_labels_elsewhere(
     assert again[0] == items[0]
     assert again[1]["display"][1]["highlight"] == ["Point [00:00:32]."]
 
-    labeled = {"item_id": items[1]["id"], "labeled_at": "2026-10-18T10:00:00Z"}
+    labeled = _label(items[1]["id"], "real")
     monkeypatch.setattr(f, "read_labels", lambda t: [labeled] if t == task else [])
     v2 = _export_setup(tmp_path, monkeypatch, [_row(0, [_issue(), other])], "v2")
     capsys.readouterr()
@@ -348,6 +473,56 @@ def test_label_export_keeps_labeled_items_and_skips_labels_elsewhere(
         i["id"] for i in f.read_jsonl(f.label_task("v2", "dev") / "items.jsonl")
     ] == [items[0]["id"]]
     assert "1 already labeled in another variant" in capsys.readouterr().out
+
+
+def test_label_export_keeps_a_gone_flag_only_while_its_label_counts(
+    tmp_path, monkeypatch, capsys
+):
+    other = _issue("Point [00:00:32].")
+    args = _export_setup(tmp_path, monkeypatch, [_row(0, [_issue(), other])])
+    f.cmd_label_export(args)
+    task = f.label_task("base", "dev")
+    gone = _key("Point [00:00:32].")
+    (task / "labels.jsonl").write_text(
+        f.json.dumps({"kind": "label", "item_id": gone}) + "\n"
+    )
+    (task / "task.toml").write_text(f.label_card().replace("Video summary", "Old"))
+    _export_setup(tmp_path, monkeypatch, [_row(0, [_issue()])])
+    counted = [_label(gone, "real", severity="minor")]
+
+    def arvio(copy, quiet=False):
+        assert quiet and copy.parent == task.parent.resolve()
+        assert (copy / "task.toml").read_text() == f.label_card()
+        assert (copy / "labels.jsonl").read_bytes() == (
+            task / "labels.jsonl"
+        ).read_bytes()
+        assert gone in {i["id"] for i in f.read_jsonl(copy / "items.jsonl")}
+        return counted
+
+    monkeypatch.setattr(f, "read_labels", arvio)
+    capsys.readouterr()
+    f.cmd_label_export(args)
+    out = capsys.readouterr().out
+    assert f"updated the card in {task}. {f.CARD_CHANGE_NOTE}" in out
+    assert "kept 1 labeled items whose flag is gone" in out
+    assert [i["id"] for i in f.read_jsonl(task / "items.jsonl")] == [_key(QUOTE), gone]
+
+    counted.clear()
+    f.cmd_label_export(args)
+    assert "dropped 1 items whose flag is gone" in capsys.readouterr().out
+    assert [i["id"] for i in f.read_jsonl(task / "items.jsonl")] == [_key(QUOTE)]
+    assert not list(task.parent.glob(".label-check-*"))
+
+    def refuses(copy, quiet=False):
+        raise f.LabelError(f"{copy / 'labels.jsonl'}:1: error: item_id: '{gone}'")
+
+    monkeypatch.setattr(f, "read_labels", refuses)
+    before = {p.name: p.read_bytes() for p in task.iterdir()}
+    error = f"{task / 'labels.jsonl'}:1: error: item_id: '{gone}'\nNothing was written"
+    with pytest.raises(SystemExit, match=f.re.escape(error)):
+        f.cmd_label_export(args)
+    assert {p.name: p.read_bytes() for p in task.iterdir()} == before
+    assert not list(task.parent.glob(".label-check-*"))
 
 
 def _label(key: str, answer: str, locked: bool = True, severity: str = "") -> dict:
@@ -360,16 +535,45 @@ def _label(key: str, answer: str, locked: bool = True, severity: str = "") -> di
     }
 
 
+def test_current_labels_prefers_locked_then_latest(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(f, "EVAL_DIR", tmp_path)
+    a, b = f.label_task("a", "dev"), f.label_task("b", "dev")
+    stale = f.label_task("c", "dev")
+    for task in (a, b, stale):
+        task.mkdir(parents=True)
+        (task / "task.toml").write_text(f.label_card())
+    (stale / "task.toml").write_text("format = 1\n")
+    later = "2026-10-19T10:00:00Z"
+    rows = {
+        a: [_label("k1", "real"), _label("k2", "real")],
+        b: [
+            _label("k1", "false_alarm", locked=False) | {"labeled_at": later},
+            _label("k2", "false_alarm") | {"labeled_at": later},
+        ],
+    }
+
+    def fake(task):
+        assert task != stale, "a folder with an older card must not be read"
+        return rows[task]
+
+    monkeypatch.setattr(f, "read_labels", fake)
+    labels, old = f.current_labels()
+    assert labels["k1"]["answer"] == "real"
+    assert labels["k2"]["answer"] == "false_alarm"
+    assert old == [stale]
+    assert f.export_args(stale) == "--variant c --split dev"
+
+
 def test_report_labels_counts_finished_labels_and_precision(
     tmp_path, monkeypatch, capsys
 ):
-    monkeypatch.setattr(f, "EVAL_DIR", tmp_path)
-    quotes = ["a", "b", "c", "d", "e"]
+    quotes = ["Short.", "Start low", "Sonnet took", "Point [00:00:32].", "Intro."]
     part = [
         _row(0, [_issue(q) for q in quotes[:3]]),
         _row(1, [_issue(q) for q in quotes[3:]]),
     ]
-    keys = [f.flag_key("2026-01-01_x", q) for q in quotes]
+    _export_setup(tmp_path, monkeypatch, part)
+    keys = [_key(q) for q in quotes]
     task = f.label_task("base", "dev")
     task.mkdir(parents=True)
     (task / "task.toml").write_text(f.label_card())
@@ -382,20 +586,16 @@ def test_report_labels_counts_finished_labels_and_precision(
         _label(keys[2], "real", severity="minor"),
         _label(keys[3], "real", locked=False, severity="minor"),
     ]
-
-    def fake(t):
-        assert t == task, "a folder with an older card must not be read"
-        return labels
-
-    monkeypatch.setattr(f, "read_labels", fake)
+    monkeypatch.setattr(f, "read_labels", lambda t: labels)
     f.report_labels(part, "base", "dev")
     out = capsys.readouterr().out
-    assert "has an older card" in out
-    assert "flags labeled: 3/5 (real 2, false alarm 1, can't tell 0)" in out
+    assert "has an older card; run label-export --variant old --split dev" in out
+    assert "flagged lines labeled: 3/5 (real 2, false alarm 1, can't tell 0)" in out
     assert "1 more labeled in an arvio session not finished yet" in out
     lo, hi = f.wilson(2, 3)
-    assert f"judge precision on labeled flags: 2/3 (95% CI {lo:.2f}-{hi:.2f}" in out
+    assert f"judge precision on labeled lines: 2/3 (95% CI {lo:.2f}-{hi:.2f}" in out
     assert "real errors per summary" not in out
+    assert "label them" not in out
 
     labels[3]["locked"] = True
     labels.append(_label(keys[4], "cant_tell"))
@@ -406,25 +606,133 @@ def test_report_labels_counts_finished_labels_and_precision(
     assert "can't tell counted as no error" in out
 
 
-def test_report_labels_says_how_to_start(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(f, "EVAL_DIR", tmp_path)
-    f.report_labels([_row(0, [_issue()])], "base", "all")
+def test_report_labels_counts_a_repeated_line_once(tmp_path, monkeypatch, capsys):
+    part = [_row(0, [_issue()]), _row(1, [_issue()])]
+    _export_setup(tmp_path, monkeypatch, part)
+    monkeypatch.setattr(f, "read_labels", lambda t: [_label(_key(QUOTE), "real")])
+    f.label_task("base", "dev").mkdir(parents=True)
+    (f.label_task("base", "dev") / "task.toml").write_text(f.label_card())
+    f.report_labels(part, "base", "dev")
     out = capsys.readouterr().out
-    assert "flags labeled: 0/1" in out
+    assert "flagged lines labeled: 1/1" in out
+    assert "from 2 flags: a line flagged in more than one summary counts once" in out
+    assert "judge precision on labeled lines: 1/1" in out
+    assert "real errors per summary: mean 1.00" in out
+
+
+def test_report_labels_says_how_to_start(tmp_path, monkeypatch, capsys):
+    part = [_row(0, [_issue(), _issue("")])]
+    _export_setup(tmp_path, monkeypatch, part)
+    f.label_task("base", "held-out").mkdir(parents=True)
+    f.report_labels(part, "base", "all")
+    out = capsys.readouterr().out
+    assert "flagged lines labeled: 0/1" in out
+    assert "1 flags with an empty summary_quote can't be labeled" in out
     assert "label-export --variant base --split dev" in out
 
 
-def test_read_labels_fails_closed(tmp_path, monkeypatch):
+def test_system_report_prints_spend_before_a_label_failure(
+    tmp_path, monkeypatch, capsys
+):
+    args = _export_setup(tmp_path, monkeypatch, [_row(0, [_issue()])])
+    task = f.label_task("base", "dev")
+    task.mkdir(parents=True)
+    (task / "task.toml").write_text(f.label_card())
+
+    def broken(t):
+        raise f.LabelError("arvio is not installed or not on PATH")
+
+    monkeypatch.setattr(f, "read_labels", broken)
+    assert f.cmd_system_report(args) == 1
+    out = capsys.readouterr().out
+    assert out.index("measured spend") < out.index("labels not counted: arvio is not")
+
+
+def test_read_labels_parses_and_fails_closed(tmp_path, monkeypatch, capsys):
     def missing(*a, **kw):
         raise FileNotFoundError("arvio")
 
     monkeypatch.setattr(f.subprocess, "run", missing)
-    with pytest.raises(SystemExit, match="uv tool install"):
+    with pytest.raises(f.LabelError, match="not on PATH"):
         f.read_labels(tmp_path)
     failed = f.subprocess.CompletedProcess([], 1, "", "task.toml: bad")
     monkeypatch.setattr(f.subprocess, "run", lambda *a, **kw: failed)
-    with pytest.raises(SystemExit, match="task.toml: bad"):
+    with pytest.raises(f.LabelError, match="task.toml: bad"):
         f.read_labels(tmp_path)
+    row = _label("k1", "real") | {"note": "a b"}
+    out = f.json.dumps(row, ensure_ascii=False) + "\n"
+    ok = f.subprocess.CompletedProcess([], 0, out, "labels.jsonl:3: old card\n")
+    monkeypatch.setattr(f.subprocess, "run", lambda *a, **kw: ok)
+    assert f.read_labels(tmp_path) == [row]
+    assert "labels.jsonl:3: old card" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(shutil.which("arvio") is None, reason="arvio is not installed")
+def test_arvio_accepts_the_exported_folder(tmp_path, monkeypatch, capsys):
+    rows = [
+        _row(
+            0,
+            [
+                _issue(),
+                _issue("start LOW on the layers"),
+                _issue("Not in it."),
+                _issue("[00:00:32]", transcript_ts="00:00:02-00:00:32"),
+            ],
+        )
+    ]
+    f.cmd_label_export(_export_setup(tmp_path, monkeypatch, rows))
+    done = _arvio_check(tmp_path, f.label_task("base", "dev"))
+    assert done.returncode == 0, done.stderr
+
+
+def _arvio_check(tmp_path, task):
+    return f.subprocess.run(
+        ["arvio", "check", str(task)],
+        capture_output=True,
+        text=True,
+        env=f.os.environ | {"ARVIO_DATA_DIR": str(tmp_path / "arvio")},
+        check=False,
+    )
+
+
+@pytest.mark.skipif(shutil.which("arvio") is None, reason="arvio is not installed")
+def test_arvio_decides_which_gone_flags_stay(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("ARVIO_DATA_DIR", str(tmp_path / "arvio"))
+    other = _issue("Point [00:00:32].")
+    args = _export_setup(tmp_path, monkeypatch, [_row(0, [_issue(), other])])
+    f.cmd_label_export(args)
+    task = f.label_task("base", "dev")
+    version = f.re.search(r"card version (\w+)", _arvio_check(tmp_path, task).stdout)
+    gone = _key("Point [00:00:32].")
+    label = {
+        "kind": "label",
+        "item_id": gone,
+        "task_version": version.group(1),
+        "answer": "real",
+        "followups": {"severity": "minor"},
+    }
+    (task / "labels.jsonl").write_text(f.json.dumps(label) + "\n")
+    _export_setup(tmp_path, monkeypatch, [_row(0, [_issue()])])
+    capsys.readouterr()
+    f.cmd_label_export(args)
+    assert "kept 1 labeled items whose flag is gone" in capsys.readouterr().out
+    assert [i["id"] for i in f.read_jsonl(task / "items.jsonl")] == [_key(QUOTE), gone]
+    assert _arvio_check(tmp_path, task).returncode == 0
+
+    label["task_version"] = "000000000000"
+    (task / "labels.jsonl").write_text(f.json.dumps(label) + "\n")
+    f.cmd_label_export(args)
+    assert "dropped 1 items whose flag is gone" in capsys.readouterr().out
+    assert [i["id"] for i in f.read_jsonl(task / "items.jsonl")] == [_key(QUOTE)]
+    done = _arvio_check(tmp_path, task)
+    assert done.returncode == 0, done.stderr
+    assert "ok: 1 items, 0 labeled" in done.stdout
+
+    label["task_version"] = version.group(1)
+    (task / "labels.jsonl").write_text(f.json.dumps(label) + "\n")
+    with pytest.raises(SystemExit, match="Nothing was written"):
+        f.cmd_label_export(args)
+    assert not list(task.parent.glob(".label-check-*"))
 
 
 def test_run_parallel_records_rows_and_failures(tmp_path):
