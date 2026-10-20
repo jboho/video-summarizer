@@ -1553,6 +1553,14 @@ def test_label_export_sample_keeps_labels_outside_the_draw(
         in capsys.readouterr().out
     )
 
+    # Back to the first draw: the labeled item is in it and isn't counted as to label.
+    args.seed = "7"
+    f.cmd_label_export(args)
+    assert (
+        "1 to label in this folder (1 labeled already), 0 already labeled"
+        in capsys.readouterr().out
+    )
+
     # A counted label whose flag is gone keeps its item but isn't drawn.
     left = [q for q, k in zip(QUOTES, keys, strict=True) if k != drawn[0]]
     _export_setup(tmp_path, monkeypatch, [_row(0, [_issue(q) for q in left])])

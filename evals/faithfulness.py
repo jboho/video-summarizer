@@ -1728,7 +1728,7 @@ def export_labels(args, task: Path, part: list[dict]) -> int:
         )
         print(
             f"drew {len(draw)} of them (seed {args.seed!r}, saved in sample.json): "
-            f"{here} to label in this folder"
+            f"{here - before} to label in this folder"
             + (f" ({before} labeled already)" if before else "")
             + f", {len(draw) - here} already labeled in another label folder; "
             f"kept {outside} labeled items from before outside the draw"
