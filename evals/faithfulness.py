@@ -1547,8 +1547,17 @@ def label_task(variant: str, split: str) -> Path:
 
 
 def export_args(task: Path) -> str:
-    """The label-export options that write an existing label folder."""
-    return f"--variant {task.parent.name} --split {task.name.removeprefix('label-')}"
+    """The label-export options that write an existing label folder, with
+    its saved draw if it has one."""
+    args = f"--variant {task.parent.name} --split {task.name.removeprefix('label-')}"
+    try:
+        draw = read_draw(task)
+    except (OSError, ValueError):
+        return args
+    if draw is None:
+        return args
+    seed, size, _ = draw
+    return f"--sample {size} --seed {shlex.quote(seed)} {args}"
 
 
 def current_labels(
@@ -1810,7 +1819,6 @@ def report_labels(part: list[dict], variant: str, split: str) -> None:
         per_row,
         {k: v["answer"] for k, v in done.items()},
         set(labels) - set(done),
-        stale,
     )
     if found.value is None:
         print(f"  real errors per summary not shown: {found.reason}")
@@ -1864,7 +1872,7 @@ def read_draw(task: Path) -> tuple[str, int, set[str]] | None:
         and type(d.get("n")) is int
         and d["n"] >= 1
         and isinstance(d.get("keys"), list)
-        and 0 < len(d["keys"]) <= d["n"]
+        and len(d["keys"]) <= d["n"]
         and all(isinstance(k, str) for k in d["keys"])
     ):
         raise ValueError(f"{path} is not a saved draw")
@@ -1893,12 +1901,10 @@ def real_errors(
     per_row: list[list[str | None]],
     done: dict,
     pending: set[str],
-    stale: list[Path],
 ) -> RealErrors:
     """Real errors per summary in part. done maps a key to its finished
     answer, from any label folder; pending holds the keys labeled only in a
-    session not finished yet; stale holds the label folders whose card is
-    older, whose labels aren't in done or pending."""
+    session not finished yet."""
     if any(k is None for ks in per_row for k in ks):
         return RealErrors(reason=EMPTY_QUOTE_REASON)
     n = len(part)
@@ -1941,7 +1947,8 @@ def real_errors(
         # one skipped at export because another folder's label, which no
         # longer counts, covered it.
         lost = {k for k in keys if k not in done and k not in pending}
-        if task in stale or (
+        card = task / "task.toml"
+        if (card.exists() and card.read_text(encoding="utf-8") != label_card()) or (
             lost and not lost <= {i["id"] for i in read_jsonl(task / "items.jsonl")}
         ):
             return RealErrors(
@@ -2143,14 +2150,13 @@ def label_figures(
     variant: str,
     done: dict[str, str],
     pending: set[str],
-    stale: list[Path],
 ) -> tuple[list[Figure], RealErrors]:
     """compare's label rows for one variant, and its real errors per summary."""
     per_row = [row_keys(variant, r) for r in part]
     quotes = list(dict.fromkeys(k for ks in per_row for k in ks if k is not None))
     answers = [done.get(k) for k in quotes]
     real, false = answers.count("real"), answers.count("false_alarm")
-    found = real_errors(part, variant, per_row, done, pending, stale)
+    found = real_errors(part, variant, per_row, done, pending)
     if found.value is None:
         errors: Figure = ("real errors per summary", "-", None)
     else:
@@ -2192,7 +2198,7 @@ def cmd_compare(args) -> int:
         done = {k: v["answer"] for k, v in labels.items() if v["locked"]}
         pending = set(labels) - set(done)
         extra = [
-            label_figures(p, v, done, pending, stale)
+            label_figures(p, v, done, pending)
             for p, v in zip(parts, names, strict=True)
         ]
     except (LabelError, OSError, ValueError) as e:

@@ -1779,7 +1779,10 @@ def test_estimate_asks_for_label_export_when_the_draw_folder_is_stale(
     (f.label_task("base", "dev") / "task.toml").write_text("old card\n")
     f.report_labels(rows, "base", "dev")
     out = capsys.readouterr().out
-    assert "has an older card; run label-export --variant base --split dev" in out
+    assert (
+        "has an older card; run label-export --sample 2 --seed 5 --variant base "
+        "--split dev\n" in out
+    )
     assert (
         "real errors per summary not shown: 0 of 2 drawn quotes labeled: run "
         "label-export --sample 2 --seed 5 --variant base --split dev first\n" in out
@@ -1844,6 +1847,22 @@ def test_estimate_cant_read_a_broken_draw(tmp_path, monkeypatch, capsys):
             "real errors per summary not shown: can't read the draw: "
             in capsys.readouterr().out
         ), broken
+
+
+def test_estimate_redraws_after_an_empty_draw(tmp_path, monkeypatch, capsys):
+    # label-export saves an empty draw when no flag is new; once flags appear
+    # it no longer matches them.
+    rows = [_row(0, [_issue(q) for q in QUOTES[:3]])]
+    args = _export_setup(tmp_path, monkeypatch, rows)
+    monkeypatch.setattr(f, "read_labels", lambda t: [])
+    args.sample = 1
+    f.cmd_label_export(args)
+    capsys.readouterr()
+    (f.label_task("base", "dev") / "sample.json").write_text(
+        '{"seed": "1", "n": 1, "keys": []}'
+    )
+    f.report_labels(rows, "base", "dev")
+    assert "the flags changed since the draw" in capsys.readouterr().out
 
 
 def _split_rows(held_out: list[str]) -> list[dict]:
