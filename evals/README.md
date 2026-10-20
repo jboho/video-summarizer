@@ -150,7 +150,9 @@ prints the flag rows.
 The ranges are approximate. A mean per summary uses a t multiplier, or an exact
 Poisson range on the total when every summary has the same count. The
 estimate's range multiplies the low ends, and the high ends, of the flags per
-summary range and the precision's 95% CI, so it is wide. The variants are
+summary range and the 95% CI of the share of drawn quotes that are real (can't
+tell counted as not real), widened to include the weighted point estimate if
+needed, so it is wide. The variants are
 summarized with the same model and judged by the same judge, so a difference
 is the prompt's. Twelve dev videos is a small sample, and two reps of one video
 are not independent, so the ranges are narrower than they should be: treat a

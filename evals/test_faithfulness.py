@@ -1761,19 +1761,89 @@ def test_estimate_waits_for_every_drawn_quote(tmp_path, monkeypatch, capsys):
     assert "estimated real errors per summary: 3.00" in capsys.readouterr().out
 
 
+def test_estimate_asks_for_label_export_when_the_draw_folder_is_stale(
+    tmp_path, monkeypatch, capsys
+):
+    rows = [_row(0, [_issue(q) for q in QUOTES[:3]])]
+    args = _export_setup(tmp_path, monkeypatch, rows)
+    monkeypatch.setattr(f, "read_labels", lambda t: [])
+    args.sample, args.seed = 2, "5"
+    f.cmd_label_export(args)
+    labels = [_label(k, "real") for k in _draw()["keys"]]
+    monkeypatch.setattr(f, "read_labels", lambda t: labels)
+    capsys.readouterr()
+    f.report_labels(rows, "base", "dev")
+    assert "estimated real errors per summary: 3.00" in capsys.readouterr().out
+
+    # Every item shows a label in arvio, but none counts until label-export.
+    (f.label_task("base", "dev") / "task.toml").write_text("old card\n")
+    f.report_labels(rows, "base", "dev")
+    out = capsys.readouterr().out
+    assert "has an older card; run label-export --variant base --split dev" in out
+    assert (
+        "real errors per summary not shown: 0 of 2 drawn quotes labeled: run "
+        "label-export --sample 2 --seed 5 --variant base --split dev first\n" in out
+    )
+    assert "arvio and press Finish" not in out
+    f.cmd_compare(_compare_args("base", "base"))
+    assert (
+        "base: real errors per summary not shown: 0 of 2 drawn quotes labeled: "
+        "run label-export --sample 2" in capsys.readouterr().out
+    )
+
+
+def test_estimate_asks_for_label_export_when_a_skipped_quote_loses_its_label(
+    tmp_path, monkeypatch, capsys
+):
+    rows = [_row(0, [_issue(q) for q in QUOTES])]
+    args = _export_setup(tmp_path, monkeypatch, rows)
+    keys = [_key(q) for q in QUOTES]
+    other = _label_folder("other")
+    monkeypatch.setattr(
+        f, "read_labels", lambda t: [_label(keys[0], "real")] if t == other else []
+    )
+    args.sample = 2
+    args.seed = _seed_where(keys, 2, lambda d: keys[0] in d)
+    f.cmd_label_export(args)
+    task = f.label_task("base", "dev")
+    assert keys[0] not in [i["id"] for i in f.read_jsonl(task / "items.jsonl")]
+    capsys.readouterr()
+    f.report_labels(rows, "base", "dev")
+    assert (
+        "1 of 2 drawn quotes labeled: label the rest in arvio and press Finish\n"
+        in capsys.readouterr().out
+    )
+
+    # The other folder's label stops counting: the drawn quote it covered has
+    # no item here, so arvio can't show it until label-export.
+    (other / "task.toml").write_text("old card\n")
+    f.report_labels(rows, "base", "dev")
+    out = capsys.readouterr().out
+    assert (
+        "0 of 2 drawn quotes labeled: run label-export --sample 2 --seed "
+        f"{args.seed} --variant base --split dev first\n" in out
+    )
+
+
 def test_estimate_cant_read_a_broken_draw(tmp_path, monkeypatch, capsys):
     rows = [_row(0, [_issue(q) for q in QUOTES[:3]])]
     args = _export_setup(tmp_path, monkeypatch, rows)
     monkeypatch.setattr(f, "read_labels", lambda t: [])
     args.sample = 1
     f.cmd_label_export(args)
-    (f.label_task("base", "dev") / "sample.json").write_text("{not json")
     capsys.readouterr()
-    f.report_labels(rows, "base", "dev")
-    assert (
-        "real errors per summary not shown: can't read the draw: "
-        in capsys.readouterr().out
-    )
+    for broken in (
+        "{not json",
+        '{"seed": "1", "n": 0, "keys": []}',
+        '{"seed": "1", "n": true, "keys": ["a"]}',
+        '{"seed": "1", "n": 1, "keys": ["a", "b"]}',
+    ):
+        (f.label_task("base", "dev") / "sample.json").write_text(broken)
+        f.report_labels(rows, "base", "dev")
+        assert (
+            "real errors per summary not shown: can't read the draw: "
+            in capsys.readouterr().out
+        ), broken
 
 
 def _split_rows(held_out: list[str]) -> list[dict]:
