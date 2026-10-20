@@ -93,13 +93,13 @@ The report then shows how many flagged quotes are labeled (the same quote on
 the same line, flagged in several summaries, counts once), the judge's
 precision on them with a 95% CI, and, once every flag is labeled, real errors
 per summary and the share of summaries with no real major error (before that,
-an estimate from a sample; see Fewer labels). Compare variants on labeled real
-errors, and read the precision line before trusting raw counts. A flag with an
-empty `summary_quote` has nothing to show, so it can't be labeled; while any
-summary has one, the report leaves out real errors per summary, counted or
-estimated, and says why. If one quote has a different answer or severity in
-two label folders, the report says how many and uses a finished label first,
-then the latest.
+an estimate from a sample once all of it is labeled; see Fewer labels). Compare
+variants on labeled real errors, and read the precision line before trusting
+raw counts. A flag with an empty `summary_quote` has nothing to show, so it
+can't be labeled; while any summary has one, the report leaves out real errors
+per summary, counted or estimated, and says why. If one quote has a different
+answer or severity in two label folders, the report says how many and uses a
+finished label first, then the latest.
 
 Any change to the task card, even to its title, marks the older label folders
 stale in the report until you run `label-export` for them again. Do that
@@ -122,9 +122,13 @@ larger N with the same seed adds to it. An export without `--sample` exports
 every flag and leaves `sample.json` as it was.
 
 While some flags are unlabeled, the report estimates real errors per summary
-from the labels on the variant's drawn quotes only, wherever they were made.
-The drawn quotes are a random sample of the variant's flags; labels from a full
-pass of another variant are not, so they don't count toward the estimate. The
+from the labels on the variant's drawn quotes only, wherever they were made,
+once every drawn quote has a finished label. The whole draw is a random sample
+of the variant's flags; part of it is not, since a drawn quote labeled in
+another variant's folder counts at once, and those are the quotes both variants
+flag. Until then the report says how many drawn quotes are labeled, and how
+many wait in a session not finished yet. Labels from a full pass of another
+variant on quotes outside the draw don't count toward the estimate. The
 estimate is flagged quotes per summary times the judge's precision on the drawn
 quotes, each quote weighted by the number of summaries that flag it, with can't
 tell counted as not real, as in the counted figure. Once every flag is labeled,
@@ -132,15 +136,16 @@ the report shows the counted figure instead. There is no estimate for a
 variant without a draw, for one whose flags changed since its draw (export
 again), or for `--split all` when both splits have flags (a draw is per split).
 
-`compare A B` prints both variants side by side: flags per summary, the share
-with no major flag, how many flagged quotes are labeled, the judge's
-precision, and real errors per summary (counted, or marked "(est.)"), each with
-a 95% range. Where the two ranges overlap it says "ranges overlap"; otherwise
-it names the variant with fewer flags, more summaries with no major flag, or
-fewer real errors. Precision gets no verdict: the two variants share labels on
-the quotes they share, so their ranges aren't independent. It warns when the
-variants cover different videos or different reps of a video, and if the
-labels can't be read it still prints the flag rows.
+`compare A B` prints both variants side by side: the number of summaries, flags
+per summary, the share with no major flag, how many flagged quotes are labeled,
+the judge's precision, and real errors per summary (counted, or marked
+"(est.)"). Each rate has a 95% range; the two counts have none. Where the two
+ranges overlap it says "ranges overlap"; otherwise it names the variant with
+fewer flags, more summaries with no major flag, or fewer real errors. Precision
+gets no verdict: the two variants share labels on the quotes they share, so
+their ranges aren't independent. It warns when the variants cover different
+videos or different reps of a video, and if the labels can't be read it still
+prints the flag rows.
 
 The ranges are approximate. A mean per summary uses a t multiplier, or an exact
 Poisson range on the total when every summary has the same count. The

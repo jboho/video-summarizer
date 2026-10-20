@@ -1581,6 +1581,21 @@ def test_label_export_sample_must_be_positive(monkeypatch, capsys):
     assert "must be 1 or more" in capsys.readouterr().err
 
 
+def test_label_export_seed_needs_sample(tmp_path, monkeypatch, capsys):
+    argv = ["faithfulness.py", "label-export", "--variant", "base", "--seed", "3"]
+    monkeypatch.setattr(f.sys, "argv", argv)
+    with pytest.raises(SystemExit) as e:
+        f.main()
+    assert e.value.code == 2
+    assert "--seed needs --sample" in capsys.readouterr().err
+
+    _export_setup(tmp_path, monkeypatch, [_row(0, [_issue(q) for q in QUOTES])])
+    monkeypatch.setattr(f.sys, "argv", [*argv[:4], "--sample", "2"])
+    monkeypatch.setattr(f, "read_labels", lambda t: [])
+    assert f.main() == 0
+    assert _draw()["seed"] == "1"
+
+
 def _two_videos_two_reps(tmp_path, monkeypatch):
     """Each summary flags its video's real quote and a false alarm of its own."""
     rows, real, false = [], [], []
@@ -1598,9 +1613,9 @@ def test_estimate_weights_quotes_by_the_summaries_that_flag_them(
 ):
     rows, args, real, false = _two_videos_two_reps(tmp_path, monkeypatch)
     monkeypatch.setattr(f, "read_labels", lambda t: [])
-    args.sample = 50
+    args.sample = 5
+    args.seed = _seed_where(real + false, 5, lambda d: false[-1] not in d)
     f.cmd_label_export(args)
-    assert len(_draw()["keys"]) == 6
     labels = [_label(k, "real") for k in real] + [
         _label(k, "false_alarm") for k in false
     ]
@@ -1609,10 +1624,10 @@ def test_estimate_weights_quotes_by_the_summaries_that_flag_them(
     f.report_labels(rows, "base", "dev")
     out = capsys.readouterr().out
     # 2 flagged quotes per summary times 4/7: each real quote is flagged in 2
-    # summaries, each false alarm in 1, and one false alarm is unlabeled. The
-    # counted figure is 1.00.
+    # summaries, each false alarm in 1, and the undrawn false alarm is
+    # unlabeled. The counted figure is 1.00.
     assert "estimated real errors per summary: 1.14 (range" in out
-    assert "2 real of 5 labeled of 6 drawn" in out
+    assert "2 real of 5 drawn" in out
     # Can't tell counts as not real, as in the counted figure.
     unsure = [*labels[:-2], _label(false[-2], "cant_tell")]
     monkeypatch.setattr(f, "read_labels", lambda t: unsure)
@@ -1647,21 +1662,38 @@ def test_estimate_uses_only_the_variants_own_draw(tmp_path, monkeypatch, capsys)
     )
     f.cmd_label_export(args)
     capsys.readouterr()
+    # The quote base labeled is not a random half of the draw: wait for the rest.
     f.report_labels(b, "v2", "dev")
     out = capsys.readouterr().out
     assert "judge precision on labeled quotes: 1/3" in out
-    lo, hi = f.poisson_range(5)
-    p_lo = f.wilson(1, 1)[0]
+    assert "estimated" not in out
     assert (
-        f"estimated real errors per summary: 5.00 (range {lo * p_lo:.2f}-"
-        f"{hi:.2f}, approximate)" in out
+        "real errors per summary not shown: 1 of 2 drawn quotes labeled: label "
+        "the rest in arvio and press Finish\n" in out
     )
-    assert "1 real of 1 labeled of 2 drawn" in out
+    f.cmd_compare(_compare_args("base", "v2"))
+    out = capsys.readouterr().out
+    assert "(est.)" not in out
+    assert "v2: real errors per summary not shown: 1 of 2 drawn" in out
+
+    v2 = f.label_task("v2", "dev")
+    mine = next(k for k in _draw("v2")["keys"] if k != keys[0])
+    labels_by = {base: labels, v2: [_label(mine, "false_alarm")]}
+    monkeypatch.setattr(f, "read_labels", lambda t: labels_by.get(t, []))
+    f.report_labels(b, "v2", "dev")
+    out = capsys.readouterr().out
+    lo, hi = f.poisson_range(5)
+    p_lo, p_hi = f.wilson(1, 2)
+    assert (
+        f"estimated real errors per summary: 2.50 (range {lo * p_lo:.2f}-"
+        f"{hi * p_hi:.2f}, approximate)" in out
+    )
+    assert "1 real of 2 drawn" in out
 
     assert f.cmd_compare(_compare_args("base", "v2")) == 0
     out = capsys.readouterr().out
     errors = next(ln for ln in out.splitlines() if "real errors per summary" in ln)
-    assert " 1.00 (" in errors and "5.00 (est.) (" in errors
+    assert " 1.00 (" in errors and "2.50 (est.) (" in errors
     assert errors.endswith("ranges overlap (one counted, one estimated)")
 
     (f.label_task("v2", "dev") / "sample.json").unlink()
@@ -1677,8 +1709,10 @@ def test_estimate_uses_only_the_variants_own_draw(tmp_path, monkeypatch, capsys)
 def test_estimate_needs_the_draw_to_match_todays_flags(tmp_path, monkeypatch, capsys):
     rows = [_row(0, [_issue(q) for q in QUOTES[:3]])]
     args = _export_setup(tmp_path, monkeypatch, rows)
-    monkeypatch.setattr(f, "read_labels", lambda t: [_label(_key(QUOTES[0]), "real")])
-    args.sample = 50
+    first = _key(QUOTES[0])
+    monkeypatch.setattr(f, "read_labels", lambda t: [_label(first, "real")])
+    args.sample = 1
+    args.seed = _seed_where([_key(q) for q in QUOTES[:3]], 1, lambda d: first in d)
     f.cmd_label_export(args)
     capsys.readouterr()
     f.report_labels(rows, "base", "dev")
@@ -1688,7 +1722,95 @@ def test_estimate_needs_the_draw_to_match_todays_flags(tmp_path, monkeypatch, ca
     f.report_labels(more, "base", "dev")
     out = capsys.readouterr().out
     assert "estimated" not in out
-    assert "the flags changed since the draw: run label-export --sample 50" in out
+    assert (
+        f"the flags changed since the draw: run label-export --sample 1 --seed "
+        f"{args.seed} --variant base --split dev again" in out
+    )
+    drawn = {"seed": "my seed", "n": 1, "keys": ["gone"]}
+    (f.label_task("base", "dev") / "sample.json").write_text(f.json.dumps(drawn))
+    f.report_labels(more, "base", "dev")
+    assert "--sample 1 --seed 'my seed' --variant" in capsys.readouterr().out
+
+
+def test_estimate_waits_for_every_drawn_quote(tmp_path, monkeypatch, capsys):
+    rows = [_row(0, [_issue(q) for q in QUOTES[:3]])]
+    args = _export_setup(tmp_path, monkeypatch, rows)
+    monkeypatch.setattr(f, "read_labels", lambda t: [])
+    args.sample = 2
+    f.cmd_label_export(args)
+    drawn = _draw()["keys"]
+    capsys.readouterr()
+    f.report_labels(rows, "base", "dev")
+    out = capsys.readouterr().out
+    assert (
+        "real errors per summary not shown: 0 of 2 drawn quotes labeled: label "
+        "the rest in arvio and press Finish\n" in out
+    )
+    # A label in a session not finished yet doesn't count, and the reason says so.
+    labels = [_label(drawn[0], "real"), _label(drawn[1], "real", locked=False)]
+    monkeypatch.setattr(f, "read_labels", lambda t: labels)
+    f.report_labels(rows, "base", "dev")
+    out = capsys.readouterr().out
+    assert (
+        "1 of 2 drawn quotes labeled: label the rest in arvio and press Finish "
+        "(1 labeled in a session not finished yet, in this or another label "
+        "folder)" in out
+    )
+    labels[1]["locked"] = True
+    f.report_labels(rows, "base", "dev")
+    assert "estimated real errors per summary: 3.00" in capsys.readouterr().out
+
+
+def test_estimate_cant_read_a_broken_draw(tmp_path, monkeypatch, capsys):
+    rows = [_row(0, [_issue(q) for q in QUOTES[:3]])]
+    args = _export_setup(tmp_path, monkeypatch, rows)
+    monkeypatch.setattr(f, "read_labels", lambda t: [])
+    args.sample = 1
+    f.cmd_label_export(args)
+    (f.label_task("base", "dev") / "sample.json").write_text("{not json")
+    capsys.readouterr()
+    f.report_labels(rows, "base", "dev")
+    assert (
+        "real errors per summary not shown: can't read the draw: "
+        in capsys.readouterr().out
+    )
+
+
+def _split_rows(held_out: list[str]) -> list[dict]:
+    """A dev summary flagging three quotes and a held-out one flagging these."""
+    rows = [
+        _row(0, [_issue(q) for q in QUOTES[:3]]),
+        _row(0, [_issue(q) for q in held_out], video="2026-01-02_x"),
+    ]
+    rows[1]["split"] = "held-out"
+    return rows
+
+
+def test_estimate_for_split_all_needs_flags_in_one_split(tmp_path, monkeypatch, capsys):
+    rows = _split_rows(QUOTES[3:])
+    _export_setup(tmp_path, monkeypatch, rows)
+    monkeypatch.setattr(f, "read_labels", lambda t: [])
+    f.report_labels(rows, "base", "all")
+    assert (
+        "real errors per summary not shown: draws are per split: use --split dev "
+        "or --split held-out" in capsys.readouterr().out
+    )
+
+
+def test_estimate_for_split_all_uses_the_one_flagged_splits_draw(
+    tmp_path, monkeypatch, capsys
+):
+    rows = _split_rows([])
+    args = _export_setup(tmp_path, monkeypatch, rows)
+    first = _key(QUOTES[0])
+    monkeypatch.setattr(f, "read_labels", lambda t: [_label(first, "real")])
+    args.sample = 1
+    args.seed = _seed_where([_key(q) for q in QUOTES[:3]], 1, lambda d: first in d)
+    f.cmd_label_export(args)
+    capsys.readouterr()
+    f.report_labels(rows, "base", "all")
+    # 3 flags over both summaries, all real in the draw.
+    assert "estimated real errors per summary: 1.50" in capsys.readouterr().out
 
 
 def test_no_estimate_or_count_while_a_quote_is_empty(tmp_path, monkeypatch, capsys):
@@ -1724,7 +1846,12 @@ def test_mean_range_uses_t_or_an_exact_poisson_range():
     assert lo == 0 and round(hi, 3) == round(0.5 + 12.706 * 0.5, 3)
     xs = [float(i % 3) for i in range(40)]
     m, sd = f.mean_sd(xs)
-    assert f.mean_range(xs)[1] == pytest.approx(m + 1.96 * sd / f.math.sqrt(40))
+    want = m + 2.0227 * sd / f.math.sqrt(40)
+    assert f.mean_range(xs)[1] == pytest.approx(want, rel=1e-4)
+    # Exact t quantiles past the table, and no jump where it ends.
+    for df, t in ((31, 2.0395), (60, 2.0003), (120, 1.9799)):
+        assert f.t975(df) == pytest.approx(t, abs=0.0005)
+    assert f.t975(30) - f.t975(31) < 0.01
 
 
 def _compare_args(a: str, b: str):
@@ -1808,8 +1935,28 @@ def test_compare_names_the_better_variant(tmp_path, monkeypatch, capsys):
         assert lines["no major flag"].endswith("v2 more summaries with no major flag")
         cells = lines["real errors per summary"].split()[4:]
         assert sorted(cells) == ["(0.00-0.37)", "-", "0.00"]
+    _label_folder("base")
+    labels = [
+        _label(_key(q, video=f"2026-01-0{d}_x"), "real")
+        for q in QUOTES[:4]
+        for d in range(1, 6)
+    ]
+    monkeypatch.setattr(f, "read_labels", lambda t: labels)
+    f.cmd_compare(_compare_args("base", "v2"))
+    errors = _table(capsys.readouterr().out)["real errors per summary"]
+    assert "4.00 (" in errors and "(est.)" not in errors
+    assert errors.endswith("v2 fewer real errors")
     with pytest.raises(SystemExit, match="no judged summaries for 'nope'"):
         f.cmd_compare(_compare_args("base", "nope"))
+
+
+def test_compare_warns_about_different_videos(tmp_path, monkeypatch, capsys):
+    _export_setup(tmp_path, monkeypatch, [_row(0, [])])
+    _export_setup(tmp_path, monkeypatch, [_row(0, [], video="2026-01-02_x")], "v2")
+    f.cmd_compare(_compare_args("base", "v2"))
+    out = capsys.readouterr().out
+    assert "the two variants cover different videos" in out
+    assert "different reps" not in out
 
 
 def test_compare_prints_flags_when_labels_fail(tmp_path, monkeypatch, capsys):

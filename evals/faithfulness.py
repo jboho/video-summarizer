@@ -21,6 +21,7 @@ The system eval measures the summarizer itself on a fixed set of videos:
                    held-out split is scored once per variant
     label-export   write the judge's flags as an arvio task, to label by hand
     system-report  error rates per split, and the judge's precision on those labels
+    compare        two variants side by side, with 95% ranges on the rates
 
 The prompt-edit loop is described step by step in evals/README.md.
 
@@ -37,6 +38,7 @@ import json
 import math
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -1803,7 +1805,11 @@ def report_labels(part: list[dict], variant: str, split: str) -> None:
             "video are not independent)"
         )
     found = real_errors(
-        part, variant, per_row, {k: v["answer"] for k, v in done.items()}
+        part,
+        variant,
+        per_row,
+        {k: v["answer"] for k, v in done.items()},
+        set(labels) - set(done),
     )
     if found.value is None:
         print(f"  real errors per summary not shown: {found.reason}")
@@ -1813,9 +1819,8 @@ def report_labels(part: list[dict], variant: str, split: str) -> None:
             f"  estimated real errors per summary: {found.value:.2f} (range "
             f"{found.low:.2f}-{found.high:.2f}, approximate): {found.flags:.2f} "
             "flagged quotes per summary times the judge precision on the drawn "
-            f"quotes, {found.real} real of {found.labeled} labeled of "
-            f"{found.drawn} drawn (each weighted by the summaries that flag it; "
-            "can't tell counted as not real)"
+            f"quotes, {found.real} real of {found.drawn} drawn (each weighted by "
+            "the summaries that flag it; can't tell counted as not real)"
         )
         return
     per = []
@@ -1866,8 +1871,8 @@ def read_draw(task: Path) -> tuple[str, int, set[str]] | None:
 @dataclass
 class RealErrors:
     """Real errors per summary: counted once every flagged quote is labeled,
-    estimated from the variant's draw before that. value None means neither,
-    for the reason given."""
+    estimated before that once every quote in the variant's draw is. value
+    None means neither, for the reason given."""
 
     value: float | None = None
     low: float = 0.0
@@ -1876,15 +1881,19 @@ class RealErrors:
     reason: str = ""
     flags: float = 0.0
     drawn: int = 0
-    labeled: int = 0
     real: int = 0
 
 
 def real_errors(
-    part: list[dict], variant: str, per_row: list[list[str | None]], done: dict
+    part: list[dict],
+    variant: str,
+    per_row: list[list[str | None]],
+    done: dict,
+    pending: set[str],
 ) -> RealErrors:
     """Real errors per summary in part. done maps a key to its finished
-    answer, from any label folder."""
+    answer, from any label folder; pending holds the keys labeled only in a
+    session not finished yet."""
     if any(k is None for ks in per_row for k in ks):
         return RealErrors(reason=EMPTY_QUOTE_REASON)
     n = len(part)
@@ -1914,14 +1923,24 @@ def real_errors(
     if set(sorted(quotes, key=lambda k: sample_rank(seed, k))[:size]) != keys:
         return RealErrors(
             reason="the flags changed since the draw: run label-export --sample "
-            f"{size} --seed {seed} --variant {variant} --split {split} again"
+            f"{size} --seed {shlex.quote(seed)} --variant {variant} --split {split} "
+            "again"
         )
+    # Only the whole draw is a random sample. Part of it is not: a drawn quote
+    # labeled in another variant's folder counts at once, and those are the
+    # quotes both variants flag.
     got = [k for k in keys if k in done]
-    if not got:
-        return RealErrors(
-            reason=f"none of the {len(keys)} drawn quotes is labeled yet",
-            drawn=len(keys),
+    if len(got) < len(keys):
+        reason = (
+            f"{len(got)} of {len(keys)} drawn quotes labeled: label the rest in "
+            "arvio and press Finish"
         )
+        if held := sum(k in pending for k in keys if k not in done):
+            reason += (
+                f" ({held} labeled in a session not finished yet, in this or "
+                "another label folder)"
+            )
+        return RealErrors(reason=reason)
     # c_k: the summaries that flag quote k. Weighting by it makes the estimate
     # equal the counted figure once every quote is labeled.
     c = {k: sum(k in s for s in sets) for k in got}
@@ -1938,7 +1957,6 @@ def real_errors(
         estimated=True,
         flags=flags,
         drawn=len(keys),
-        labeled=len(got),
         real=len(real),
     )
 
@@ -1981,6 +1999,16 @@ def poisson_range(k: int) -> tuple[float, float]:
     return (solve(0.975, k - 1) if k else 0.0), solve(0.025, k)
 
 
+def t975(df: int) -> float:
+    """The 97.5% quantile of Student's t: the table up to 30 degrees of
+    freedom, then a Cornish-Fisher expansion around the normal quantile,
+    within 0.001 of the exact value there."""
+    if df <= len(T975):
+        return T975[df - 1]
+    z = 1.959964
+    return z + (z**3 + z) / (4 * df) + (5 * z**5 + 16 * z**3 + 3 * z) / (96 * df**2)
+
+
 def mean_range(xs: list[float]) -> tuple[float, float]:
     """An approximate 95% range of the mean of per-summary counts: a t range
     when the counts vary, else an exact Poisson range on their total."""
@@ -1989,7 +2017,7 @@ def mean_range(xs: list[float]) -> tuple[float, float]:
     if n < 2 or sd == 0:
         lo, hi = poisson_range(round(sum(xs)))
         return lo / n, hi / n
-    half = (T975[n - 2] if n - 1 <= len(T975) else 1.96) * sd / math.sqrt(n)
+    half = t975(n - 1) * sd / math.sqrt(n)
     return max(m - half, 0.0), m + half
 
 
@@ -2093,14 +2121,14 @@ def flag_figures(part: list[dict]) -> list[Figure]:
 
 
 def label_figures(
-    part: list[dict], variant: str, done: dict[str, str]
+    part: list[dict], variant: str, done: dict[str, str], pending: set[str]
 ) -> tuple[list[Figure], RealErrors]:
     """compare's label rows for one variant, and its real errors per summary."""
     per_row = [row_keys(variant, r) for r in part]
     quotes = list(dict.fromkeys(k for ks in per_row for k in ks if k is not None))
     answers = [done.get(k) for k in quotes]
     real, false = answers.count("real"), answers.count("false_alarm")
-    found = real_errors(part, variant, per_row, done)
+    found = real_errors(part, variant, per_row, done, pending)
     if found.value is None:
         errors: Figure = ("real errors per summary", "-", None)
     else:
@@ -2140,7 +2168,11 @@ def cmd_compare(args) -> int:
     try:
         labels, stale, _ = current_labels()
         done = {k: v["answer"] for k, v in labels.items() if v["locked"]}
-        extra = [label_figures(p, v, done) for p, v in zip(parts, names, strict=True)]
+        pending = set(labels) - set(done)
+        extra = [
+            label_figures(p, v, done, pending)
+            for p, v in zip(parts, names, strict=True)
+        ]
     except (LabelError, OSError, ValueError) as e:
         failed = str(e)
         extra = [([(name, "-", None) for name in LABEL_ROWS], RealErrors())] * 2
@@ -2307,7 +2339,7 @@ def main() -> int:
         type=positive_int,
         help="export only N flagged quotes, drawn at random (labeled ones stay)",
     )
-    le.add_argument("--seed", default="1", help="the draw's seed (default 1)")
+    le.add_argument("--seed", help="the draw's seed, with --sample (default 1)")
     le.set_defaults(func=cmd_label_export)
 
     cp = sub.add_parser("compare", help="two variants side by side, with labels (free)")
@@ -2317,6 +2349,11 @@ def main() -> int:
     cp.set_defaults(func=cmd_compare)
 
     args = ap.parse_args()
+    if args.cmd == "label-export":
+        if args.seed is None:
+            args.seed = "1"
+        elif args.sample is None:
+            le.error("--seed needs --sample")
     return args.func(args)
 
 
