@@ -1534,6 +1534,12 @@ def file_stamp(path: Path) -> tuple[int, int] | None:
     return st.st_mtime_ns, st.st_size
 
 
+def sample_rank(seed: str, key: str) -> str:
+    """A flag's place in a seeded random order: the same for every run and
+    every machine, and unrelated to the judge's order."""
+    return hashlib.sha256(f"{seed}\0{key}".encode()).hexdigest()
+
+
 def label_task(variant: str, split: str) -> Path:
     return system_dir(variant) / f"label-{split}"
 
@@ -1675,6 +1681,16 @@ def export_labels(args, task: Path, part: list[dict]) -> int:
             skipped += 1
         else:
             items[key] = fresh[key]
+    sampled = None
+    if args.sample is not None:
+        # Every flagged quote takes part in the draw, including ones labeled
+        # in another folder, so the labeled set stays a random sample of this
+        # variant's flags. A labeled item outside the draw stays: arvio
+        # refuses a counted label without its item.
+        pool = set(fresh) | set(items)
+        draw = sorted(pool, key=lambda k: sample_rank(args.seed, k))[: args.sample]
+        items = {k: v for k, v in items.items() if k in counted or k in draw}
+        sampled = (len(draw), len(pool))
     if file_stamp(labels_path) != seen:
         sys.exit(
             f"{labels_path} changed while exporting. "
@@ -1698,6 +1714,11 @@ def export_labels(args, task: Path, part: list[dict]) -> int:
         f"({repeats} repeats of a flagged quote, {skipped} already labeled "
         f"in another label folder) -> {task}"
     )
+    if sampled:
+        print(
+            f"sampled {sampled[0]} of {sampled[1]} flagged quotes (seed "
+            f"{args.seed!r}); the same --sample and --seed give the same draw"
+        )
     if empty:
         print(f"left out {empty} flags with an empty summary_quote: nothing to show")
     if len(items) > current:
@@ -1765,6 +1786,14 @@ def report_labels(part: list[dict], variant: str, split: str) -> None:
             "video are not independent)"
         )
     if None in answers:
+        est = real_estimate(per_row, real, false)
+        if est:
+            print(
+                f"  estimated real errors per summary: {est[0]:.2f} "
+                f"(range {est[1]:.2f}-{est[2]:.2f}): flagged quotes per summary "
+                "times the judge precision and its CI; valid only if the labeled "
+                "quotes are a random sample of the flags (label-export --sample)"
+            )
         return
     if empty:
         print(
@@ -1792,6 +1821,19 @@ def report_labels(part: list[dict], variant: str, split: str) -> None:
         "independent; counts only errors the judge flagged"
         + (", can't tell counted as no error)" if unsure else ")")
     )
+
+
+def real_estimate(
+    per_row: list[list[str | None]], real: int, false: int
+) -> tuple[float, float, float] | None:
+    """Real errors per summary estimated from a partial labeling: distinct
+    flagged quotes per summary times the judge's precision, with the range
+    from the precision's Wilson bounds. None before any real or false label."""
+    if not real + false:
+        return None
+    u = sum(len({k for k in ks if k is not None}) for ks in per_row) / len(per_row)
+    lo, hi = wilson(real, real + false)
+    return u * real / (real + false), u * lo, u * hi
 
 
 def mean_sd(xs: list[float]) -> tuple[float, float]:
@@ -1874,6 +1916,105 @@ def cmd_system_report(args) -> int:
         print(f"labels not counted: {e}")
         return 1
     return 0
+
+
+def variant_figures(
+    part: list[dict], variant: str, labels: dict[str, dict]
+) -> list[tuple[str, str, tuple[float, float] | None]]:
+    """compare's rows for one variant: (name, value, 95% range or None)."""
+    n = len(part)
+    flags = [float(len(r["issues"])) for r in part]
+    m, sd = mean_sd(flags)
+    half = 1.96 * sd / math.sqrt(n)
+    clean = sum(not any(i["severity"] == "major" for i in r["issues"]) for r in part)
+    per_row = [row_keys(variant, r) for r in part]
+    quotes = list(dict.fromkeys(k for ks in per_row for k in ks if k is not None))
+    done = {k: v["answer"] for k, v in labels.items() if v["locked"]}
+    answers = [done.get(k) for k in quotes]
+    real, false = answers.count("real"), answers.count("false_alarm")
+    rows = [
+        ("summaries", str(n), None),
+        ("judge flags per summary", f"{m:.2f}", (max(m - half, 0.0), m + half)),
+        ("no major flag", f"{clean}/{n}", wilson(clean, n)),
+        (
+            "flagged quotes labeled",
+            f"{len(quotes) - answers.count(None)}/{len(quotes)}",
+            None,
+        ),
+        (
+            "judge precision",
+            f"{real}/{real + false}" if real + false else "-",
+            wilson(real, real + false) if real + false else None,
+        ),
+    ]
+    if quotes and None not in answers and None not in sum(per_row, []):
+        per = [
+            float(sum(done[k] == "real" for k in dict.fromkeys(ks))) for ks in per_row
+        ]
+        rm, rsd = mean_sd(per)
+        rhalf = 1.96 * rsd / math.sqrt(n)
+        rows.append(
+            ("real errors per summary", f"{rm:.2f}", (max(rm - rhalf, 0.0), rm + rhalf))
+        )
+    elif est := real_estimate(per_row, real, false):
+        rows.append(("real errors per summary (est.)", f"{est[0]:.2f}", est[1:]))
+    return rows
+
+
+def cmd_compare(args) -> int:
+    parts = []
+    for variant in (args.a, args.b):
+        part = ok_rows(variant, args.split)
+        if not part:
+            sys.exit(f"no judged summaries for {variant!r} in split {args.split!r}")
+        parts.append(part)
+    try:
+        labels, stale, _ = current_labels()
+        figs = [
+            variant_figures(p, v, labels)
+            for p, v in zip(parts, (args.a, args.b), strict=True)
+        ]
+    except (LabelError, OSError, ValueError) as e:
+        sys.exit(f"labels not counted: {e}")
+    for task in stale:
+        print(f"{task} has an older card; run label-export {export_args(task)}")
+    if {r["video"] for r in parts[0]} != {r["video"] for r in parts[1]}:
+        print("the two variants cover different videos; read the gaps with care")
+    names = dict.fromkeys(name for rows in figs for name, _, _ in rows)
+    by = [{name: (v, ci) for name, v, ci in rows} for rows in figs]
+
+    def cell(row: tuple[str, tuple[float, float] | None] | None) -> str:
+        if row is None:
+            return "-"
+        v, ci = row
+        return f"{v} ({ci[0]:.2f}-{ci[1]:.2f})" if ci else v
+
+    width = max(len(n) for n in names)
+    print(f"{args.split}: {args.a} vs {args.b} (95% ranges)")
+    for name in names:
+        a, b = by[0].get(name), by[1].get(name)
+        verdict = ""
+        if a and b and a[1] and b[1]:
+            (alo, ahi), (blo, bhi) = a[1], b[1]
+            verdict = (
+                "no measurable difference"
+                if alo <= bhi and blo <= ahi
+                else f"{args.a if ahi < blo else args.b} lower"
+            )
+        print(f"  {name:{width}}  {cell(a):22}  {cell(b):22}  {verdict}")
+    print(
+        "Ranges that overlap count as no measurable difference. Two reps of one "
+        "video are not independent, so the ranges are narrower than they should "
+        "be; a flag count without labels mixes real errors with judge mistakes."
+    )
+    return 0
+
+
+def positive_int(text: str) -> int:
+    n = int(text)
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be 1 or more")
+    return n
 
 
 def main() -> int:
@@ -1963,7 +2104,19 @@ def main() -> int:
     )
     le.add_argument("--variant", default="baseline", help="name for this prompt")
     le.add_argument("--split", default="dev", choices=LABEL_SPLITS)
+    le.add_argument(
+        "--sample",
+        type=positive_int,
+        help="export only N flagged quotes, drawn at random (labeled ones stay)",
+    )
+    le.add_argument("--seed", default="1", help="the draw's seed (default 1)")
     le.set_defaults(func=cmd_label_export)
+
+    cp = sub.add_parser("compare", help="two variants side by side, with labels (free)")
+    cp.add_argument("a", help="first variant")
+    cp.add_argument("b", help="second variant")
+    cp.add_argument("--split", default="dev", choices=["dev", "held-out", "all"])
+    cp.set_defaults(func=cmd_compare)
 
     args = ap.parse_args()
     return args.func(args)

@@ -55,6 +55,7 @@ Use `--reps 2` to match the baseline, so rep-to-rep noise is comparable.
 ```
 uv run evals/faithfulness.py system-report --variant baseline
 uv run evals/faithfulness.py system-report --variant grounded-v1
+uv run evals/faithfulness.py compare baseline grounded-v1
 ```
 
 The report gives judge flags per summary and per 100 claims, the share of
@@ -110,9 +111,26 @@ count. A known limit: `results.jsonl` rows don't record which judge prompt
 produced them, so after a judge prompt change, rows judged before and after it
 sit in one variant's results unmarked.
 
+**Fewer labels.** `label-export --sample 10` exports only 10 flagged quotes,
+drawn in a seeded random order (`--seed`, default 1); the same options give
+the same draw, and items you already labeled stay. Every flagged quote takes
+part in the draw, so the labeled ones are a random sample of the variant's
+flags. While some flags are unlabeled, the report estimates real errors per
+summary as flagged quotes per summary times the judge's precision, with the
+range from the precision's 95% CI. That estimate is only fair when the labels
+come from such a sample; labels made in a full pass of another variant mix in
+too, since a label covers the same quote in every variant.
+
+`compare A B` prints both variants side by side: flags per summary, the share
+with no major flag, how many flagged quotes are labeled, the judge's
+precision, and real errors per summary (counted after a full pass, estimated
+from a sample before that), each with a 95% range. Where the two ranges
+overlap it says "no measurable difference"; otherwise it names the lower one.
+
 The variants are summarized with the same model and judged by the same judge,
 so a difference is the prompt's. Twelve dev videos is a small sample: treat a
-gap inside the CIs as no difference.
+gap inside the CIs as no difference. Two reps of one video are not
+independent, so the ranges are narrower than they should be.
 
 ### 4. Repeat
 
