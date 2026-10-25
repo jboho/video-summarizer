@@ -23,9 +23,9 @@ jobs:
       - name: Format check
         run: uvx ruff format --check .
       - name: Test
-        # arvio is pinned to the v0.1.0 commit; REQUIRE_ARVIO turns the tests
+        # arvio is pinned to the v0.2.0 commit; REQUIRE_ARVIO turns the tests
         # that run it from skipped into failed when it is missing.
         env:
           REQUIRE_ARVIO: "1"
-          ARVIO: "arvio @ git+https://github.com/jboho/arvio@4e2a493048c87b8221587fc05bddbc5985bd5e80"
+          ARVIO: "arvio @ git+https://github.com/jboho/arvio@196653e66f544da22aa54ea233567e12e9a2e579"
         run: uv run --python ${{ matrix.python-version }} --with pytest --with anthropic --with openai --with "$ARVIO" pytest -q -rs
