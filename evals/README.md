@@ -72,7 +72,7 @@ the judge pointed to. It keeps the judge's answer hidden until you finish a
 session.
 
 ```
-uv tool install git+https://github.com/jboho/arvio@v0.1.0   # once
+uv tool install git+https://github.com/jboho/arvio@v0.2.0   # once
 uv run evals/faithfulness.py label-export --variant grounded-v1
 arvio add $VIDEO_SUMMARY_DIR/_eval/runs/system/grounded-v1/label-dev  # once
 arvio

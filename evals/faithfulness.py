@@ -1100,7 +1100,7 @@ def record_held_out(run_dir: Path, args, jobs: int) -> None:
 # label-export writes a task folder per variant and split; arvio writes
 # labels.jsonl into it, and system-report reads the labels back.
 
-ARVIO_INSTALL = "uv tool install git+https://github.com/jboho/arvio@v0.1.0"
+ARVIO_INSTALL = "uv tool install git+https://github.com/jboho/arvio@v0.2.0"
 WINDOW_S = 60
 # The judge writes transcript_ts as HH:MM:SS, [HH:MM:SS] or a range of two.
 JUDGE_TS_RE = re.compile(r"(\d{2}):(\d{2}):(\d{2})")
