@@ -33,7 +33,7 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # Default model. Override per-run with --model or the VIDEO_SUMMARY_MODEL env var.
 # Sonnet is the default: cheaper and plenty for summarization. Use
