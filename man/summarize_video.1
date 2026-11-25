@@ -1,4 +1,4 @@
-.TH SUMMARIZE_VIDEO 1 "October 11, 2026" "video-summarizer 0.2.0" "User Commands"
+.TH SUMMARIZE_VIDEO 1 "November 25, 2026" "video-summarizer 0.2.0" "User Commands"
 .SH NAME
 summarize_video \- fetch a video's captions and summarize them with an AI model
 .SH SYNOPSIS
@@ -111,7 +111,7 @@ Default:
 .B chrome
 (or the value of
 .BR VIDEO_SUMMARY_COOKIES_BROWSER ).
-YouTube answers requests without cookies with HTTP 429.
+YouTube sometimes answers requests without cookies with HTTP 429.
 .TP
 .B \-\-no\-cookies
 Send no browser cookies.
@@ -264,6 +264,59 @@ summarize_video.py "https://youtu.be/VIDEO_ID" \-\-model llama3.1 \e
   \-\-base\-url http://localhost:11434/v1
 .fi
 .RE
+.SH TROUBLESHOOTING
+Most failures come from
+.BR yt\-dlp ,
+and the script prints its error text.
+.TP
+.B yt\-dlp not found on PATH
+Install it, for example with
+.BR "brew install yt\-dlp" .
+.TP
+.B Requested format is not available
+YouTube changed its player and the installed
+.B yt\-dlp
+can no longer read it.
+A warning such as
+.B n challenge solving failed
+often comes before this error.
+Update
+.B yt\-dlp
+.RB ( "brew upgrade yt\-dlp" ,
+or
+.B yt\-dlp \-U
+for other installs).
+Until a fixed release is out,
+.B \-\-no\-cookies
+may work, because
+.B yt\-dlp
+then asks YouTube through different clients.
+.TP
+.B HTTP Error 429
+YouTube is rate-limiting requests.
+Retry later, or send a browser's cookies with
+.BR \-\-cookies\-from\-browser .
+.TP
+.BI "Could not read " BROWSER "'s cookies"
+.B yt\-dlp
+could not open that browser's cookie store.
+Pass
+.B \-\-cookies\-from\-browser
+with another browser, or
+.B \-\-no\-cookies
+to send none.
+On macOS, the first read of Chrome's cookies can ask for Keychain access;
+allow it.
+.TP
+.B No captions found for this video
+The video has no English captions.
+The script does not transcribe audio.
+.TP
+.B ANTHROPIC_API_KEY not set
+The transcript files are saved but no summary is made.
+Set the key, or use
+.B \-\-no\-summary
+to skip the summary on purpose.
 .SH SEE ALSO
 .BR yt\-dlp (1),
 .BR uv (1)
