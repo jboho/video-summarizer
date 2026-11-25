@@ -93,14 +93,15 @@ The `actionable` section adapts to the video: a numbered list for "5 things" vid
 
 ## Man page
 
-A man page lives in [`man/summarize_video.1`](man/summarize_video.1). Read it in place with `man ./man/summarize_video.1`, or install it:
+A man page lives in [`man/summarize_video.1`](man/summarize_video.1). It includes a troubleshooting section for yt-dlp errors. Read it in place with `man ./man/summarize_video.1`, or install it from the repo folder:
 
 ```bash
 mkdir -p ~/.local/share/man/man1
-cp man/summarize_video.1 ~/.local/share/man/man1/
+ln -s "$PWD/man/summarize_video.1" ~/.local/share/man/man1/summarize_video.1
+ln -s "$PWD/man/summarize_video.1" ~/.local/share/man/man1/vidsum.1   # for the vidsum alias
 ```
 
-Then `man summarize_video` works if `~/.local/share/man` is on your `MANPATH`.
+Then `man summarize_video` (and `man vidsum`) works if `~/.local/share/man` is on your `MANPATH`. A link follows the clone, so `git pull` keeps the page current; copy the file instead if you will move or delete the clone.
 
 ## Using other models
 
